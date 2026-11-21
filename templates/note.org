@@ -1,0 +1,13 @@
+#+emacs:    <!-- ; -*-Org-*- -->
+#+Title:    {title}
+#+Author:   {author}
+#+Created:  {time:%Y-%m-%d-%Hh%Mm}
+#+STARTUP:  hidestars
+#+STARTUP:  odd
+#+OPTIONS:  padline:no
+#+OPTIONS:  toc:1
+#+filename: {path}
+#+Weather:  
+#+filetags: 
+#+Notes:    add a hidden note here.
+

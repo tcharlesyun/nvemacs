@@ -1,0 +1,17 @@
+Acknowledgements
+================
+
+Thank you to Notational Velocity <https://notational.net/> for the
+original idea and implementation.
+
+Thank you to Brett Terpstra for nvALT <https://brettterpstra.com/projects/nvalt/#credits>
+and his tireless search for small fixes that make big improvements.    
+
+Thank you to Deft <https://jblevins.org/projects/deft/> for providing much
+of the Emacs integration of the Notational Velocity ideals to follow.
+
+Thank you to Org mode <https://orgmode.org/> for the fantastic tool.
+
+Thank you to the FSF <https://www.fsf.org/> for Emacs
+<https://www.gnu.org/software/emacs/> and Emacs Lisp
+<https://www.gnu.org/software/emacs/manual/elisp.html>.

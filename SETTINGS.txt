@@ -1,0 +1,253 @@
+nvEmacs 0.0.2 — Settings
+========================
+
+Set these in your init file before M-x nvemacs, for example
+
+    (setq nvemacs-watched-directories '("~/notes/" "~/journal/")
+          nvemacs-notelist-columns "title, tags, created, modified")
+
+or with M-x customize-group RET nvemacs RET. Settings live in your init
+file or custom-file; nvEmacs never writes them anywhere else.
+
+
+Notes and indexing
+------------------
+
+nvemacs-watched-directories           default ("~/notes/")
+    Folders whose notes are indexed.
+
+nvemacs-watched-directories-recursive  default t
+    Also index notes in subfolders.
+
+nvemacs-ignore-dir-regexp             default "\\`\\."
+    Subfolders whose name matches are skipped (default: hidden ones).
+
+nvemacs-import-extensions             default ("org" "md" "txt")
+    Which files are notes.
+
+nvemacs-import-max-size               default 10485760 (10 MB)
+    Larger notes are skipped and listed by M-x nvemacs-index-skipped.
+
+
+Titles and dates
+----------------
+
+nvemacs-import-title-source           default auto
+    Where a title comes from. auto: #+title: / front-matter title:, else
+    the filename, else the first heading (when the filename is only a
+    date), else the first line. filename: always the filename.
+    first-line: always the first line.
+
+nvemacs-title-match-width             default 60
+    How many display columns of a title count as a TITLE match (and show
+    in bold), cut at a word. It keeps title matches meaningful: a
+    paragraph-long "title" would make most of its words title matches,
+    which are listed first. The rest of the title still matches as
+    ordinary text. 0 = the whole title. Changing it rewrites only the
+    title part of the index, from the stored titles, at the next start or
+    search.
+
+nvemacs-filename-timestamp-regexp     default yyyy-mm-dd-HHhMMm-
+    Leading timestamp removed from filenames used as titles.
+
+Created dates (no setting): a note's own date — Org #+created:, a
+:CREATED: property, #+date:; Markdown created:, date:; a date at the
+start of the filename. Otherwise the earliest modified time nvEmacs has
+seen for the note, kept in nvemacs-dates-file and shown with a ~.
+
+
+Notelist (the result list)
+--------------------------
+
+nvemacs-notelist-columns              default (title tags modified)
+    Which columns, in which order. A list of symbols or a string:
+    "modified, tags, title, created". Names: title, tags, created,
+    modified. The title is always shown.
+
+nvemacs-notelist-preview              default t
+    After the title, the note's text as one grey line (Notational
+    Velocity's "show note body previews"). nil: the title alone.
+
+nvemacs-notelist-title-min-width      default 20
+    Narrowest title column. A narrower window first shrinks the tags
+    column, then drops tags, created, modified.
+
+nvemacs-notelist-tags-min-width       default 20
+    Narrowest tags column; with less room there is no tags column.
+
+nvemacs-notelist-tags-max-width       default 40
+    Widest the measured tags column may be; longer tags end in "…".
+    nil: no limit.
+
+nvemacs-notelist-remember-widths      default last
+    How the tags column width is kept between sessions:
+      last   measured from the first screen, then saved when nvEmacs
+             closes and on C-c C-l, and used at the next start
+      never  measured from the first screen each time; nothing saved
+      user   always nvemacs-notelist-tags-width; C-c C-l then lasts for
+             the session only
+    The width never changes by itself while you search.
+
+nvemacs-notelist-tags-width           default nil
+    The tags width used when remember-widths is user. Set it with
+    M-x nvemacs-notelist-widths-set.
+
+nvemacs-show-selected-title           default t
+    Show the selected note's title on the search line, as Notational
+    Velocity does. Typing replaces it; DEL restores your search.
+
+nvemacs-grow-delay                    default 0.5 (seconds)
+    With an empty search, the newest-notes list grows by a screenful each
+    time Emacs has been idle this much longer, while the cursor is in the
+    notelist, until every note is listed. The complete list is then kept, and
+    clearing a later search puts it back at once. nil: one screenful.
+
+nvemacs-search-delay                  default 0.1 (seconds)
+    Pause after the last keystroke before the search runs.
+
+
+Layout
+------
+
+nvemacs-default-arrangement           default stacked
+    stacked (search line, list, note, top to bottom) or side (list beside
+    the note), when the frame fits it; else the other, else the list
+    alone. C-c C-v overrides it per frame.
+
+nvemacs-notelist-min-width            default 50   (columns, side by side)
+nvemacs-notelist-min-lines            default 10   (lines, stacked)
+nvemacs-notecontent-min-width         default 80   (columns, side by side)
+nvemacs-notecontent-min-lines         default 20   (lines, stacked)
+    The smallest useful list and note pane; they decide which
+    arrangement fits the frame.
+
+nvemacs-preview-delay                 default 0.2 (seconds)
+    Pause on a row before its note is shown in the note pane.
+
+nvemacs-other-window-action           default pane
+    What C-o does. pane: open the note in the note pane and move there
+    (in the list-only arrangement, a temporary pane; C-u: stay in the
+    list). open: the same as RET.
+
+nvemacs-return-layout                 default rebuild
+    What returning to nvEmacs does when you rearranged its windows.
+    rebuild: restore nvEmacs's arrangement. respect: keep your windows
+    and only show the list.
+
+
+New notes
+---------
+
+nvemacs-new-note-directory            default nil
+    Where new notes go; nil = the first watched folder. Must be inside a
+    watched folder.
+
+nvemacs-new-note-naming-styles
+    default ((diary :filename "{time:%Y-%m-%d-%Hh%Mm}-{title}" :template "note.org")
+             (topic :filename "{title}" :template "note.org"))
+    Named styles: :filename pattern, optional :directory (relative to the
+    new-note directory) and :template file. The template gives the note
+    its text and extension; a style without :template starts a blank
+    note. Placeholders {title}, {time:FORMAT}; templates may also use
+    {path} and {author} (user-full-name). With no title the filename is
+    the bare time stamp. See README.txt, "New notes and templates".
+
+nvemacs-new-note-naming-style-default  default diary
+    The style RET and C-c C-n use.
+
+nvemacs-template-directory            default the templates/ folder shipped with nvEmacs
+    Folder of the template files the styles name. The shipped folder has
+    note.org (the default), note.md (the same fields as front matter) and
+    note.txt ("type here", a known-good template for testing). For your
+    own, use a folder outside the watched folders, or a hidden subfolder,
+    so templates are not indexed. A template that cannot be found starts
+    a blank note, with a message naming it.
+
+nvemacs-new-note-extension            default "org"
+    Extension of blank new notes (styles without :template).
+
+
+Tags
+----
+
+nvemacs-tags-in-file-extensions       default ("org" "md")
+    Notes whose file tags live inside the note (#+filetags:, tags:).
+    Any other note keeps them in a sister file: foo.txt -> foo.txt.tags.
+
+
+Keeping the index up to date
+----------------------------
+
+nvemacs-reconcile-on-startup          default t
+    Re-scan the watched folders in the background when nvEmacs starts.
+
+nvemacs-sync-delay                    default 1.0 (seconds)
+    Wait after a folder change before re-scanning; changes in between are
+    handled together. The re-scan then waits until you pause typing
+    (0.5 s idle). nvEmacs's own saves do not cause one; coming back to
+    the notelist from a note does.
+
+nvemacs-sync-on-focus                 default t
+    Re-scan when an Emacs frame regains focus (macOS folder watching
+    misses notes rewritten in place by other programs).
+
+nvemacs-sync-slice-ms                 default 10
+    Longest stretch of background work (comparing the folders with the
+    index, indexing changed notes) before Emacs attends to your typing
+    again. Listing one large folder is a single step: about 16-32 ms for
+    4,440 notes.
+
+nvemacs-auto-save-interval            default 3.0 (seconds)
+    Idle time before nvEmacs copies your edits to a private temp file.
+    This covers the notes it opened; a note you already had open when
+    nvEmacs showed it is yours to save. The note's own file is written
+    when you save it, when the cursor leaves it, and when nvEmacs exits,
+    and only if its text changed. A new value takes effect at the next
+    pause. nil: no temp files, and nothing written on leaving or at
+    exit; closing a changed note, or Emacs, still offers to save it.
+
+
+Data and logs
+-------------
+
+nvemacs-data-directory                default nvemacs/ in user-emacs-directory
+    Where nvEmacs keeps what it writes: index.sqlite, dates.eld,
+    state.eld, pending/ and discarded/ (edits waiting or thrown away)
+    and nvemacs-log/ (usually ~/.emacs.d/nvemacs/). Folders
+    nvEmacs creates for these are readable by you only, and so is every
+    file it writes there: the index holds the text of every note.
+
+nvemacs-index-file                    default nil = index.sqlite in the data directory
+    The search index. A cache: safe to delete; it is rebuilt.
+
+nvemacs-dates-file                    default nil = dates.eld in the data directory
+    Created dates of notes that declare none (earliest modified time
+    seen). Plain text, paths relative to their watched folder, so it can
+    be shared between machines (e.g. in Dropbox). Keep it: it cannot be
+    rebuilt from the notes.
+
+nvemacs-state-file                    default nil = state.eld in the data directory
+    Remembered values (the tags column width). Safe to delete.
+
+nvemacs-instrumentation               default on (global minor mode)
+    Log each start, session and re-scan: counts and timings only, never
+    note text, searches or file names. Turn it off with
+    (setq nvemacs-instrumentation nil) before nvemacs is loaded, or
+    M-x nvemacs-instrumentation. M-x nvemacs-report-all shows the logs.
+
+nvemacs-log-directory                 default nil = nvemacs-log/ in the data directory
+    Where the logs go: startup.jsonl, session.jsonl, sync.jsonl.
+
+nvemacs-log-max-bytes                 default 10240
+    Largest size of each log; the oldest records are dropped.
+
+
+Faces (M-x customize-group RET nvemacs RET)
+-------------------------------------------
+
+nvemacs-notelist-title     bold            the title's match part
+nvemacs-notelist-preview   inherits shadow the rest of a long title, the
+                                           preview, (untitled)
+nvemacs-tags               inherits shadow the tags column
+nvemacs-selected-title     inherits region a selected title on the search
+                                           line

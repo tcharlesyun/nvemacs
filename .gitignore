@@ -1,0 +1,4 @@
+*.elc
+*.eln
+test_data/
+**/.DS_Store
