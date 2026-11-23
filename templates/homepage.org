@@ -1,0 +1,47 @@
+* nvEmacs home
+
+Last updated {written}.
+
+** Your notes
+
+- Notes indexed: {notes} ({notes-size})
+{notes-by-type}
+
+** Watched folders
+
+{folders}
+
+** Recently edited
+
+{recent}
+
+** Index
+
+- Database: {index-file} ({index-size})
+- Last full rebuild: {last-rebuild}
+- First screen of the notelist: {list-time}
+- Index ready: {index-ready}
+
+** Versions
+
+- nvEmacs {version}, Emacs {emacs-version}, SQLite {sqlite-version}
+
+** Searching
+
+- Type words: a note matches when it contains all of them, in any order.
+- =tag:work= lists notes with a tag starting with "work".
+- =-tag:old= leaves out notes with a tag starting with "old".
+
+** Keys
+
+A key works only where the table says.  Inside a note, every other key keeps
+its usual meaning: in an Org note, =C-c C-q= is Org's own tag command.
+
+{commands}
+
+** Customizing this page
+
+nvEmacs rewrites this page when it exits, so edit the template, not this
+file.  Copy =homepage.org= from the =templates= folder of nvEmacs to your
+=nvemacs-template-directory= and change it there.  For Markdown, use
+=homepage.md= and set =nvemacs-homepage-template= to that name.

@@ -4,7 +4,7 @@
 
 ;; Author: T. Charles Yun
 ;; Assisted-by: LLM/Claude Code (2026)
-;; Version: 0.0.2
+;; Version: 0.0.3
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: convenience, text, notes, Notational Velocity
 ;; URL: https://github.com/tcharlesyun/nvemacs
@@ -709,6 +709,33 @@ default is readable by the user only (`make-temp-file' creates 0600)."
       (error (ignore-errors (delete-file tmp))
              (signal (car err) (cdr err))))))
 
+(defun nvemacs--command-text (command expectation solution)
+  "Return an error's text: COMMAND EXPECTATION.  SOLUTION.
+It says what was tried, what that needs and what to do next."
+  (format "%s %s.  %s." command expectation solution))
+
+(defun nvemacs--command-error (command expectation solution)
+  "Signal a `user-error' that reads COMMAND EXPECTATION.  SOLUTION."
+  (user-error "%s" (nvemacs--command-text command expectation solution)))
+
+(defconst nvemacs--path-tail-length 20
+  "How many characters of a path a background error shows, from its end.")
+
+(defun nvemacs--short-path (path)
+  "Return PATH for an error message: its filename, then the end of the path.
+A full path can push the rest of the message out of the echo area."
+  (format "%s <%s>" (file-name-nondirectory path)
+          (if (<= (length path) nvemacs--path-tail-length)
+              path
+            (concat "..." (substring path (- nvemacs--path-tail-length))))))
+
+(defun nvemacs--error-reason (err)
+  "Return the text of ERR without the file names a file error ends with."
+  (if (and (memq 'file-error (get (car err) 'error-conditions))
+           (stringp (nth 2 err)) (nth 3 err))
+      (nth 2 err)                       ; ("Opening output file" REASON FILE)
+    (error-message-string err)))
+
 (defconst nvemacs--sqlite-missing
   (concat "Emacs lacks sqlite support that nvEmacs requires.  "
           "Refer to your Emacs documentation to determine how to obtain sqlite support.  "
@@ -732,7 +759,7 @@ Without it there is no index, and nvEmacs cannot run."
        nvemacs--db
        (format "CREATE VIRTUAL TABLE IF NOT EXISTS %s USING fts5(x, tokenize='trigram case_sensitive 0', detail=none)" tbl)))
     (sqlite-execute nvemacs--db
-                    "CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY, path TEXT UNIQUE, size INTEGER, mtime INTEGER, title TEXT, other INTEGER, tmtime INTEGER, preview TEXT, created INTEGER, cguess INTEGER)")
+                    "CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY, path TEXT UNIQUE, size INTEGER, mtime INTEGER, title TEXT, other INTEGER, tmtime INTEGER, preview TEXT, created INTEGER, cguess INTEGER, added INTEGER, title_key TEXT, tags_key TEXT)")
     ;; Tags: FOLDED is the tag through `nvemacs--fold' (search is
     ;; case-insensitive); TAG keeps the spelling for display; KIND file|section.
     (sqlite-execute nvemacs--db
@@ -800,23 +827,26 @@ or not UTF-8."
 
 (defun nvemacs--insert-note (db path attrs rec)
   "Insert record REC of PATH (file ATTRS) into DB under rowid = mtime.
-A note without a declared created date gets the earliest modified time
-seen for it (`nvemacs--dates-seen'), marked as a guess."
+Every note gets an Added date (`nvemacs--added-date').  Its Created date
+is the one it declares, or else Added, marked as a guess.  The folded
+title and tags are stored as sort keys: Emacs's SQLite API has no custom
+collation."
   (let ((id (nvemacs--mtime-us attrs)))
     (while (sqlite-select db "SELECT 1 FROM meta WHERE id = ?" (list id))
       (setq id (1+ id)))                          ; collision: nudge by 1
     (pcase-let* ((`(,title ,ftitle ,ftext ,other ,tags ,preview ,declared) rec)
-                 (created (or declared
-                              (nvemacs--dates-seen
-                               path (time-convert (file-attribute-modification-time attrs) 'integer)))))
-      (sqlite-execute db "INSERT INTO meta VALUES (?,?,?,?,?,?,?,?,?,?)"
+                 (added (nvemacs--added-date path attrs))
+                 (folded (mapcar (lambda (tk) (nvemacs--fold (car tk))) tags)))
+      (sqlite-execute db "INSERT INTO meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
                       (list id path (file-attribute-size attrs)
                             (nvemacs--mtime-us attrs) title (if other 1 0)
                             (nvemacs--sister-mtime path)
-                            preview created (if declared 0 1)))
-      (dolist (tk tags)
-        (sqlite-execute db "INSERT INTO tags VALUES (?,?,?,?)"
-                        (list id (car tk) (nvemacs--fold (car tk)) (symbol-name (cdr tk)))))
+                            preview (or declared added) (if declared 0 1)
+                            added (nvemacs--fold (or title ""))
+                            (nvemacs--tags-key folded)))
+      (cl-loop for tk in tags for f in folded
+               do (sqlite-execute db "INSERT INTO tags VALUES (?,?,?,?)"
+                                  (list id (car tk) f (symbol-name (cdr tk)))))
       (sqlite-execute db "INSERT INTO body(rowid, x) VALUES (?,?)" (list id ftext))
       (sqlite-execute db "INSERT INTO title(rowid, x) VALUES (?,?)" (list id ftitle))
       (when other
@@ -824,26 +854,83 @@ seen for it (`nvemacs--dates-seen'), marked as a guess."
         (sqlite-execute db "INSERT INTO title_other(rowid, x) VALUES (?,?)" (list id ftitle))))
     id))
 
-;;;; Created dates: earliest modified time seen
+;;;; Added dates: the earliest date seen for a file
 ;;
-;; A note that declares no created date gets the EARLIEST modified time
-;; nvEmacs has seen for it: a file found days late keeps
-;; its own older mtime, an edit never moves it, a restore with an older
-;; mtime moves it earlier. These cannot be rebuilt from the notes, so they
-;; live in their own plain-text file, not in the index: deleting the index
-;; stays a safe fix, and the file can sit in Dropbox for several machines
-;; (keys are relative to the watched directory). The index copies the
-;; dates into `meta' for display and sorting.
+;; Every note has an Added date: the earlier of the file's creation and
+;; modified dates when nvEmacs first finds it. A file found days late keeps
+;; its own older date, an edit never moves it, a restore with an older
+;; mtime moves it earlier. A note that declares no created date also shows
+;; it as its Created date, marked `~'. These dates cannot be rebuilt from
+;; the notes, so they live in their own plain-text file, not in the index:
+;; deleting the index stays a safe fix, and the file can sit in Dropbox for
+;; several machines (keys are relative to the watched directory). The index
+;; copies the dates into `meta' for display and sorting.
 
 (defcustom nvemacs-dates-file nil
-  "File of the created dates of notes that declare none.
+  "File of the Added dates of notes.
 nil means dates.eld in `nvemacs-data-directory'.  The file is plain
 text and may be shared between machines (e.g. through Dropbox)."
   :type '(choice (const nil) file))
 
 (defvar nvemacs--dates nil
-  "Hash table of created dates: KEY -> earliest modified time seen.
+  "Hash table of Added dates: KEY -> earliest date seen for the file.
 Times are in seconds.  nil until read from `nvemacs--dates-file'.")
+
+(defvar nvemacs--births nil
+  "During a full build, PATH -> creation time, read for all notes at once.
+nil otherwise: a note seen for the first time is then asked about alone.")
+
+(defconst nvemacs--birth-batch 500 "Paths given to one run of `stat'.")
+
+(defun nvemacs--birth-program ()
+  "Return (PROGRAM ARGS...) printing \"SECONDS PATH\", or nil if there is none.
+The full path on macOS and BSD: a GNU `stat' earlier in PATH reads `-f'
+as something else."
+  (pcase system-type
+    ((or 'darwin 'berkeley-unix)
+     (and (file-executable-p "/usr/bin/stat") '("/usr/bin/stat" "-f" "%B %N")))
+    ('gnu/linux
+     (let ((p (executable-find "stat"))) (and p (list p "-c" "%W %n"))))))
+
+(defun nvemacs--birth-times (paths)
+  "Return a hash table PATH -> creation time in seconds, for PATHS.
+Emacs cannot read this date, so `stat' is run.  A file it reports no
+date for is left out.  Each answer carries its path, because `stat'
+prints nothing for a file that is gone."
+  (let ((h (make-hash-table :test #'equal))
+        (program (nvemacs--birth-program))
+        (coding-system-for-read 'utf-8)
+        (coding-system-for-write 'utf-8)
+        (default-directory "/"))
+    (when program
+      (while paths
+        (let ((chunk (seq-take paths nvemacs--birth-batch)))
+          (setq paths (nthcdr nvemacs--birth-batch paths))
+          (with-temp-buffer
+            (ignore-errors
+              (apply #'call-process (car program) nil '(t nil) nil (append (cdr program) chunk)))
+            (goto-char (point-min))
+            (while (re-search-forward "^\\([0-9]+\\) \\(.+\\)$" nil t)
+              (let ((secs (string-to-number (match-string 1))))
+                (when (> secs 0) (puthash (match-string 2) secs h))))))))
+    h))
+
+(defun nvemacs--added-date (path attrs)
+  "Record and return the Added date of note PATH, with file ATTRS.
+The creation date is asked for only when the note is not in the dates
+file yet: saves can reset it, and it costs a process."
+  (let* ((mtime (time-convert (file-attribute-modification-time attrs) 'integer))
+         (birth (cond (nvemacs--births (gethash path nvemacs--births))
+                      ((gethash (nvemacs--dates-key path) (nvemacs--dates-table)) nil)
+                      (t (gethash path (nvemacs--birth-times (list path)))))))
+    (nvemacs--dates-seen path (if (and birth (< birth mtime)) birth mtime))))
+
+(defun nvemacs--tags-key (folded)
+  "Return the sort key of a note's FOLDED tags.
+They are alphabetized and de-duplicated: the order they were entered in
+means nothing.  The separator sorts below every character, so a note
+tagged art and zoo comes before one tagged artist."
+  (mapconcat #'identity (sort (delete-dups (copy-sequence folded)) #'string<) "\x01"))
 
 (defvar nvemacs--dates-dirty nil "Non-nil when `nvemacs--dates' has unsaved changes.")
 
@@ -867,8 +954,12 @@ Where both have a key, the earlier date is kept."
                   (let ((old (gethash (car e) table)))
                     (when (or (null old) (< (cadr e) old)) (puthash (car e) (cadr e) table))))))
           (end-of-file nil)
-          (invalid-read-syntax (message "nvEmacs: %s is damaged; read up to line %d"
-                                        f (line-number-at-pos)))))))
+          (invalid-read-syntax
+           (message "%s" (nvemacs--command-text
+                          "The Added-dates file"
+                          (format "requires valid entries, and %s is damaged at line %d"
+                                  (nvemacs--short-path f) (line-number-at-pos))
+                          "Repair or restore that file")))))))
   table)
 
 (defun nvemacs--dates-table ()
@@ -902,7 +993,7 @@ machines whose home directories differ."
       path))
 
 (defun nvemacs--dates-seen (path secs)
-  "Record modification time SECS for note PATH; return the earliest seen."
+  "Record date SECS for note PATH; return the earliest seen."
   (let* ((table (nvemacs--dates-table))
          (key (nvemacs--dates-key path))
          (old (gethash key table)))
@@ -925,10 +1016,10 @@ rename."
       (maphash (lambda (k v) (push (cons k v) entries)) nvemacs--dates)
       (setq entries (sort entries (lambda (a b) (string< (car a) (car b)))))
       (with-temp-buffer
-        (insert ";; nvEmacs created dates: for notes that declare no created date, the\n"
-                ";; earliest modified time nvEmacs has seen (seconds since 1970). Paths are\n"
-                ";; relative to their watched directory. Written by nvEmacs. Keep this file:\n"
-                ";; unlike the index it cannot be rebuilt from the notes.\n")
+        (insert ";; nvEmacs Added dates: the earliest creation or modified date nvEmacs has\n"
+                ";; seen for each note (seconds since 1970). Paths are relative to their\n"
+                ";; watched directory. Written by nvEmacs. Keep this file: unlike the index\n"
+                ";; it cannot be rebuilt from the notes.\n")
         (let ((print-escape-newlines t))
           (dolist (e entries) (prin1 (list (car e) (cdr e)) (current-buffer)) (insert "\n")))
         (nvemacs--write-file f))
@@ -967,7 +1058,7 @@ Signals `nvemacs-skip' before writing anything."
 
 ;;;; Index version
 
-(defconst nvemacs--index-version 7
+(defconst nvemacs--index-version 8
   "Format version of the index.
 Bump it whenever the schema, folding, import filters or rowid unit
 change: `nvemacs' rebuilds an index with another version, because a
@@ -980,7 +1071,8 @@ stale one gives wrong results without any error.
     in the body when it is not in the text, meta.preview, meta.created and
     meta.cguess, info.match_width;
 7 = a filename with `_' also in the body as spelled
-    (`nvemacs--filename-spelling').")
+    (`nvemacs--filename-spelling');
+8 = meta.added, and the sort keys meta.title_key and meta.tags_key.")
 
 (defun nvemacs--index-current-p ()
   "Non-nil if the index was built with `nvemacs--index-version'."
@@ -1056,6 +1148,7 @@ Also sets `nvemacs--listed-dirs' and `nvemacs--listed-sisters'."
   (when (file-exists-p (nvemacs--index-path)) (delete-file (nvemacs--index-path)))
   (let* ((db (nvemacs--db))
          (files (nvemacs--note-files))
+         (nvemacs--births (nvemacs--birth-times (mapcar #'car files)))
          (n 0))
     (setq nvemacs--skipped nil)
     (nvemacs--with-transaction db
@@ -1069,6 +1162,8 @@ Also sets `nvemacs--listed-dirs' and `nvemacs--listed-sisters'."
                       (list nvemacs--index-version))
       (sqlite-execute db "INSERT OR REPLACE INTO info VALUES ('match_width', ?)"
                       (list nvemacs-title-match-width))
+      (sqlite-execute db "INSERT OR REPLACE INTO info VALUES ('rebuilt', ?)"
+                      (list (format-time-string "%F %R")))
       (nvemacs--bump-generation db))
     (nvemacs--dates-flush)
     (dolist (tbl nvemacs--tables)
@@ -1376,7 +1471,14 @@ A logging failure is reported and never stops nvEmacs."
                       (save-excursion (forward-line 1) (< (point) (point-max))))
             (delete-region (point) (progn (forward-line 1) (point))))
           (nvemacs--write-file file)))
-    (error (message "nvEmacs: could not write the %s log: %s" kind (error-message-string err)))))
+    (error
+     (message "%s" (nvemacs--command-text
+                    (format "The %s log" kind)
+                    (format "requires a writable data folder, and %s could not be written: %s"
+                            (nvemacs--short-path
+                             (expand-file-name (concat kind ".jsonl") (nvemacs--log-directory)))
+                            (nvemacs--error-reason err))
+                    "Check the permissions of nvemacs-data-directory")))))
 
 (defun nvemacs--note-first-row ()
   "Called after rows are inserted: time the first row of a measured start."
@@ -1420,7 +1522,9 @@ A logging failure is reported and never stops nvEmacs."
 Not from a batch Emacs: tests and scripts let-bind the data directory,
 and at exit only the global default (~/.emacs.d/nvemacs/) is left."
   (unless noninteractive
-    (when (get-buffer nvemacs--buffer-name) (nvemacs--widths-save))
+    (when (get-buffer nvemacs--buffer-name)
+      (nvemacs--widths-save)
+      (nvemacs--homepage-save))
     (dolist (b (buffer-list))
       (with-current-buffer b (nvemacs--trash-if-untouched)))
     (nvemacs--session-end)))
@@ -1461,6 +1565,7 @@ fill the log)."
     (when r
       (setq r (plist-put r :wall-ms (nvemacs--ms (plist-get r :t0))))
       (setq nvemacs--last-sync (plist-put r :when (format-time-string "%F %T")))
+      (when (eq (plist-get r :trigger) 'startup) (nvemacs--homepage-checked r))
       (when (and nvemacs-instrumentation
                  (or (eq (plist-get r :trigger) 'startup) (> (plist-get r :items) 0)))
         (nvemacs--log
@@ -1649,6 +1754,9 @@ effect here."
   "Start watches, the focus trigger and auto-save."
   (add-hook 'post-command-hook #'nvemacs--check-left)
   (add-hook 'kill-emacs-query-functions #'nvemacs--quit-query 90)
+  ;; Emacs has no hook before it asks which buffers to save.
+  (advice-add 'save-some-buffers :before #'nvemacs--settle-unchanged)
+  (advice-add 'save-buffers-kill-emacs :before #'nvemacs--settle-unchanged)
   (add-function :after after-focus-change-function #'nvemacs--focus-changed)
   (unless (and nvemacs--auto-save-timer (eql nvemacs--auto-save-armed nvemacs-auto-save-interval))
     (nvemacs--auto-save-arm))
@@ -1658,7 +1766,8 @@ effect here."
 (defun nvemacs--sync-disable ()
   "Stop watches, timers, the focus trigger and auto-save."
   (dolist (w nvemacs--watches) (ignore-errors (file-notify-rm-watch (cdr w))))
-  (setq nvemacs--watches nil nvemacs--sync-queue nil nvemacs--plan nil nvemacs--sync-changes nil)
+  (setq nvemacs--watches nil nvemacs--sync-queue nil nvemacs--plan nil nvemacs--sync-changes nil
+        nvemacs--sync-run nil)            ; the next start must not join it
   (dolist (tm (list nvemacs--sync-timer nvemacs--work-timer nvemacs--auto-save-timer
                     nvemacs--pending-timer))
     (when tm (cancel-timer tm)))
@@ -1666,6 +1775,8 @@ effect here."
         nvemacs--auto-save-timer nil nvemacs--auto-save-armed nil)
   (remove-hook 'post-command-hook #'nvemacs--check-left)
   (remove-hook 'kill-emacs-query-functions #'nvemacs--quit-query)
+  (advice-remove 'save-some-buffers #'nvemacs--settle-unchanged)
+  (advice-remove 'save-buffers-kill-emacs #'nvemacs--settle-unchanged)
   (remove-function after-focus-change-function #'nvemacs--focus-changed))
 
 ;;;; Search core, no UI
@@ -1764,17 +1875,18 @@ typed).  FRAGMENT is empty or begins with \" AND\"."
        (cl-some (lambda (d) (file-in-directory-p path (expand-file-name d)))
                 nvemacs-watched-directories)))
 
-(defun nvemacs--reindex (path)
+(defun nvemacs--reindex (path &optional was)
   "Read note PATH again now and replace its index entry.
 This happens always, even when size and mtime look unchanged: a tag
 edit can keep both.  Only the note's row in the list changes: it moves
 to the top (redrawing every listed row after each auto-save stalled
-typing)."
+typing).  WAS is the path the note had, if it has just been moved."
   (when nvemacs--db
     (let* ((db nvemacs--db)
            (path (nvemacs--canonical-path path))
            (attrs (file-attributes path))
-           (old (caar (sqlite-select db "SELECT id FROM meta WHERE path = ?" (list path))))
+           (old (caar (sqlite-select db "SELECT id FROM meta WHERE path = ?"
+                                     (list (if was (nvemacs--canonical-path was) path)))))
            (new nil))
       (condition-case err
           (let ((rec (nvemacs--read-note path attrs)))
@@ -1787,7 +1899,13 @@ typing)."
             (nvemacs--list-update (list (cons old new)) t))
         (nvemacs-skip
          (push (cons path (cadr err)) nvemacs--skipped)
-         (message "nvEmacs: saved but not indexed: %s" (cadr err)))))))
+         (when was (nvemacs--forget was))
+         (message "%s" (nvemacs--command-text
+                        "The search index"
+                        (format "requires a readable note, and %s was saved but not indexed: %s"
+                                (nvemacs--short-path path)
+                                (string-replace path (file-name-nondirectory path) (cadr err)))
+                        "Fix the note, or see M-x nvemacs-index-skipped")))))))
 
 (defun nvemacs--forget (path)
   "PATH is gone (moved to the Trash by nvEmacs): drop its index entry and row."
@@ -1807,10 +1925,10 @@ typing)."
   :type 'number)
 
 (defcustom nvemacs-grow-delay 0.5
-  "Idle seconds between steps that lengthen the list of newest notes.
-With an empty search, each time Emacs has been idle this many more
-seconds, the list grows by one screenful, until every note is listed.
-nil means the list stays one screenful."
+  "Idle seconds between steps that lengthen the notelist.
+Each time Emacs has been idle this many more seconds, the list grows by
+one screenful, until every match is listed.  It also grows at once when
+the cursor nears its last row.  nil means the list stays one screenful."
   :type '(choice (number :tag "Seconds") (const :tag "Never" nil)))
 
 (defconst nvemacs--buffer-name "*nvEmacs*")
@@ -1829,6 +1947,8 @@ It answers \"already shown?\" without walking the list (that walk grew
 with the square of the rows: 47 ms of a 4,783-row redraw, measured
 2026-11-20).")
 (defvar-local nvemacs--status "" "Status text, shown in the mode line.")
+(defvar-local nvemacs--status-base ""
+  "The status text without the note naming a hidden sort column.")
 (defvar-local nvemacs--rendered-size nil
   "(WIDTH . HEIGHT) of the window when rows were last drawn.")
 (defvar-local nvemacs--selected-title nil
@@ -1838,6 +1958,14 @@ nil when the search line shows what the user typed.")
   "The typed search, kept while the search line shows a selected title.")
 (defvar nvemacs--inhibit-search nil
   "Non-nil while nvEmacs itself rewrites the search line (no new search).")
+(defvar-local nvemacs--selected-id nil
+  "Rowid of the selected note, or nil.
+Kept apart from point, which Emacs drags along when a window scrolls.")
+(defvar-local nvemacs--view-free nil
+  "Non-nil while the notelist's view has left the selection.
+Point is then only where Emacs keeps it on screen, and means nothing.")
+(defvar nvemacs--command-here nil
+  "Non-nil while a command that started in the notelist runs.")
 
 (defcustom nvemacs-show-selected-title t
   "Non-nil means the search line shows the title of the selected row.
@@ -1855,11 +1983,18 @@ restores the search you typed."
     (define-key map (kbd "RET") #'nvemacs-note-open)
     (define-key map (kbd "C-o") #'nvemacs-note-open-other-window)
     (define-key map (kbd "C-c C-c") #'nvemacs-searchbar-clear)
-    (define-key map (kbd "C-c C-q") #'nvemacs-quit)
+    (define-key map (kbd "C-c C-q") #'nvemacs-tags-edit) ; as in Org
+    (define-key map (kbd "C-c C-]") #'nvemacs-quit)
     (define-key map (kbd "C-c C-g") #'nvemacs-index-refresh)
     (define-key map (kbd "C-c C-v") #'nvemacs-layout-cycle)
     (define-key map (kbd "C-c C-l") #'nvemacs-notelist-refresh)
     (define-key map (kbd "C-c C-n") #'nvemacs-note-new)
+    (define-key map (kbd "C-c C-r") #'nvemacs-note-rename)
+    (define-key map (kbd "C-c C-w") #'nvemacs-note-move)         ; as Org's refile
+    (define-key map (kbd "C-c C-x C-a") #'nvemacs-note-move-outside) ; as Org's archive
+    (define-key map (kbd "C-c ^") #'nvemacs-notelist-sort-column)    ; as Org's sort
+    (define-key map (kbd "C-c C-x C-c") #'nvemacs-notelist-column-toggle) ; as Org's columns
+    (define-key map [header-line mouse-1] #'nvemacs--heading-click)
     ;; Mouse: nothing happens on the press; the release selects. See
     ;; `nvemacs-notelist-mouse-select'.
     (define-key map [down-mouse-1] #'ignore)
@@ -1884,15 +2019,39 @@ default press handler (`mouse-drag-region') the selected title replaced
 the search line between press and release; if that line changes height
 \(Hangul/Hanja fallback fonts are taller), every row shifts, and the
 release lands on another row or starts a drag region (Hangul
-rows could not be re-selected by mouse)."
+rows could not be re-selected by mouse).  A click in the empty space
+below the last row selects the list's window and changes nothing else."
   (interactive "e")
-  (mouse-set-point event)
+  (let ((pos (event-end event)))
+    (if (nvemacs--below-rows-p pos)
+        (progn (select-window (posn-window pos))
+               (setq this-command 'ignore)) ; not a selection: see `nvemacs--selection-update'
+      (mouse-set-point event)))
   (deactivate-mark))
+
+(defun nvemacs--below-rows-p (position)
+  "Return non-nil if the click POSITION is in the empty space below the list.
+Emacs reports such a click at the end of the buffer, exactly as it does
+one past the text of the last row; only its height on screen tells them
+apart.  That is compared in pixels, since rows with Hangul are taller."
+  (let ((win (posn-window position)))
+    (and (windowp win)
+         (eql (posn-point position) (with-current-buffer (window-buffer win) (point-max)))
+         (let ((end (posn-at-point (posn-point position) win)))
+           (and end
+                (>= (cdr (posn-x-y position))
+                    (+ (cdr (posn-x-y end))
+                       (with-selected-window win
+                         (save-excursion (goto-char (point-max))
+                                         (line-pixel-height))))))))))
 
 (defun nvemacs--refuse ()
   "Refuse an editing command in the search buffer."
   (interactive)
-  (message "nvEmacs: only typing, DEL, M-DEL, C-y and C-c C-c edit the search"))
+  (message "%s" (nvemacs--command-text
+                 (or this-original-command this-command "This command")
+                 "does not work on the search line"
+                 "Type, or use DEL, M-DEL, C-y or C-c C-c, to edit the search")))
 
 (define-derived-mode nvemacs-mode fundamental-mode "nvEmacs"
   "Notational Velocity style search over watched notes.
@@ -1911,7 +2070,151 @@ rows could not be re-selected by mouse)."
   (add-hook 'post-command-hook #'nvemacs--post-command nil t)
   (add-hook 'kill-buffer-hook #'nvemacs--search-killed nil t)
   (add-hook 'window-selection-change-functions #'nvemacs--selection-changed nil t)
+  (require 'hl-line)
+  (setq-local hl-line-range-function #'nvemacs--highlight-range)
   (hl-line-mode 1))
+
+;;;; The selected note and the view
+;;
+;; Emacs keeps point on screen, so a scrolled window drags point along. In
+;; most Emacs lists the line at point IS the selection, and scrolling changes
+;; it. Here it must not: someone reading a note can scroll
+;; the list to look at other titles. So the notelist holds two things:
+;;   the selection  `nvemacs--selected-id', which keys and clicks move;
+;;   the view       the window's scroll position, which the scroll bar, wheel
+;;                  and trackpad move.
+;; While they agree, point is on the selected row. Once the view has left it
+;; (`nvemacs--view-free'), point is wherever Emacs put it and means nothing:
+;; the cursor is hidden, the highlight stays on the selected row, and every
+;; command asks `nvemacs--selection', never point.
+
+(defvar hl-line-mode)
+(defvar hl-line-range-function)
+(declare-function hl-line-highlight "hl-line" ())
+(defvar nvemacs--rest)                  ; defined with the notelist columns
+
+(defconst nvemacs--typing-commands
+  '(self-insert-command yank delete-backward-char backward-kill-word org-self-insert-command)
+  "Commands that edit the search line from anywhere in the list.")
+
+(defun nvemacs--selection ()
+  "Return the id of the selected note, or nil.
+While the list's window is selected and its view is on the selection,
+that is the row at point.  Otherwise point may have been dragged by a
+scroll, and the remembered note counts."
+  (if (or nvemacs--view-free (not (eq (window-buffer) (current-buffer))))
+      nvemacs--selected-id
+    (and (not (nvemacs--in-query-p)) (nvemacs--row-id))))
+
+(defun nvemacs--on-search-line-p ()
+  "Return non-nil if nothing is selected: commands act from the search line."
+  (if (or nvemacs--view-free (not (eq (window-buffer) (current-buffer))))
+      (null nvemacs--selected-id)
+    (nvemacs--in-query-p)))
+
+(defun nvemacs--view-free-set (free)
+  "Record whether the view has left the selection (FREE); if so, hide the cursor."
+  (setq nvemacs--view-free free)
+  (if free (setq-local cursor-type nil) (kill-local-variable 'cursor-type)))
+
+(defun nvemacs--view-command-p (command)
+  "Return non-nil if COMMAND moves only the view: scroll bar, wheel or trackpad."
+  (and (symbolp command)
+       (string-match-p "\\`\\(?:scroll-bar-\\|mwheel-\\|mac-mwheel-\\|pixel-scroll-\\)"
+                       (symbol-name command))))
+
+(defun nvemacs--motion-command-p (command)
+  "Return non-nil if COMMAND is a keyboard move.
+Emacs marks its movement commands with `^' in their interactive spec;
+that covers `next-line', `previous-line', `scroll-up-command' and
+`scroll-down-command', whichever keys they are on."
+  (or (memq command '(nvemacs-notelist-next nvemacs-notelist-previous
+                      isearch-forward isearch-backward
+                      isearch-forward-regexp isearch-backward-regexp))
+      (and (symbolp command) (fboundp command)
+           (let ((spec (cadr (interactive-form command))))
+             (and (stringp spec) (string-prefix-p "^" spec))))))
+
+(defun nvemacs--fully-visible-p (pos window)
+  "Return non-nil if POS is on a line WINDOW shows in full.
+Moving point to a partly shown line would make Emacs scroll."
+  (let ((v (pos-visible-in-window-p pos window t)))
+    (and v (= (length v) 2))))
+
+(defun nvemacs--view-settle ()
+  "Keep the selection after the view moved.
+If the selected row, or with none the search line, is on screen, the
+cursor goes back to it.  Otherwise the view is free of the selection."
+  (let* ((id nvemacs--selected-id)
+         (home (if id (nvemacs--row-pos id) (marker-position nvemacs--query-start)))
+         (there (if id (eql (nvemacs--row-id) id) (nvemacs--in-query-p))))
+    (cond (there (nvemacs--view-free-set nil))
+          ((and home (nvemacs--fully-visible-p home (selected-window)))
+           (goto-char home)
+           (unless id (end-of-line))
+           (nvemacs--view-free-set nil))
+          (t (nvemacs--view-free-set t)))))
+
+(defun nvemacs--view-return ()
+  "Before a key moves the selection, go to the selected row and show it.
+With nothing selected there is nowhere to return to: the key acts on
+the rows on screen."
+  (let ((id nvemacs--selected-id))
+    (nvemacs--view-free-set nil)
+    (when id
+      (nvemacs--show-id id)
+      (when (and (eql (nvemacs--row-id) id) (eq (window-buffer) (current-buffer)))
+        (set-window-start (selected-window)
+                          (save-excursion (forward-line (- (/ (window-body-height) 2)))
+                                          (point)))))))
+
+(defun nvemacs--selection-update ()
+  "Work out what the command just run did to the selection.
+A click selects.  A view move, or the cursor arriving from another
+window, leaves it alone.  Any other command that ran here moves it to
+the row at point."
+  (cond
+   ((eq this-command 'nvemacs-notelist-mouse-select)
+    (nvemacs--view-free-set nil)
+    (setq nvemacs--selected-id (and (not (nvemacs--in-query-p)) (nvemacs--row-id))))
+   ((or nvemacs--view-free (nvemacs--view-command-p this-command)
+        (and (not nvemacs--command-here) (not (nvemacs--in-query-p))
+             (not (nvemacs--motion-command-p this-command))))
+    (nvemacs--view-settle))
+   (t (setq nvemacs--selected-id (and (not (nvemacs--in-query-p)) (nvemacs--row-id)))))
+  ;; `hl-line-mode' runs before this hook.
+  (when hl-line-mode (hl-line-highlight)))
+
+(defun nvemacs--selection-restore (id free starts)
+  "Put the selection ID back after the rows were drawn again.
+With FREE the view returns to its first lines, STARTS: ((WINDOW . LINE) ...)."
+  (let ((listed (and id (or (and nvemacs--shown-set (gethash id nvemacs--shown-set))
+                            (memq id nvemacs--rest)))))
+    (cond
+     (free
+      (setq nvemacs--selected-id (and listed id))
+      (pcase-dolist (`(,w . ,line) starts)
+        (let ((pos (save-excursion (goto-char (point-min)) (forward-line (1- line)) (point))))
+          (set-window-start w pos)
+          (set-window-point w pos))))
+     (id
+      (nvemacs--show-id id)
+      (if (eql (nvemacs--row-id) id)
+          (progn (setq nvemacs--selected-id id)
+                 (dolist (w (get-buffer-window-list (current-buffer) nil t))
+                   (set-window-point w (point))))
+        (setq nvemacs--selected-id nil)
+        (goto-char nvemacs--query-start)
+        (end-of-line))))))
+
+(defun nvemacs--highlight-range ()
+  "Return the span `hl-line-mode' marks: the selected row.
+While the view is free of the selection that row may be off screen,
+and with nothing selected nothing is marked."
+  (if nvemacs--view-free
+      (let ((p (and nvemacs--selected-id (nvemacs--row-pos nvemacs--selected-id))))
+        (and p (cons p (save-excursion (goto-char p) (line-beginning-position 2)))))
+    (cons (line-beginning-position) (line-beginning-position 2))))
 
 (defvar nvemacs--away nil "Non-nil once the cursor left the list for another window.")
 
@@ -1965,7 +2268,7 @@ trip to the minibuffer does not count."
   "Show the title of the row at point on the search line.
 Run after each command.  When point is not on a row, restore the typed
 search (Notational Velocity's behaviour)."
-  (let ((id (and (not (nvemacs--in-query-p)) (nvemacs--row-id))))
+  (let ((id (nvemacs--selection)))
     (cond
      ((and id (not (eql id nvemacs--selected-title)))
       (unless nvemacs--selected-title (setq nvemacs--typed (nvemacs--query)))
@@ -1986,9 +2289,16 @@ line."
 Run before each command.  If a query-editing command runs while point
 is on the result rows, move point to the end of the query.  While a
 selected title is shown, typing or yanking replaces it (a new search);
-DEL and M-DEL restore the typed search and do nothing else."
-  (when (memq this-command '(self-insert-command yank delete-backward-char
-                             backward-kill-word org-self-insert-command))
+DEL and M-DEL restore the typed search and do nothing else.  With the
+view scrolled away from the selection, a keyboard move first returns to
+it (see `nvemacs--view-return')."
+  (setq nvemacs--command-here t)
+  (when nvemacs--view-free
+    (cond ((memq this-command nvemacs--typing-commands)
+           (setq nvemacs--selected-id nil)
+           (nvemacs--view-free-set nil))
+          ((nvemacs--motion-command-p this-command) (nvemacs--view-return))))
+  (when (memq this-command nvemacs--typing-commands)
     (unless (nvemacs--in-query-p)
       (goto-char nvemacs--query-start)
       (end-of-line))
@@ -2077,11 +2387,15 @@ a GUI, `string-width' is about 20 times slower than in batch."
 ;; disorienting).
 
 (defcustom nvemacs-notelist-columns '(title tags modified)
-  "Notelist columns and their order.
+  "Notelist columns at launch, and their order.
 A list of symbols, or a string of comma-separated names, such as
-\"modified, tags, title, created\".  Names: title, tags, created,
-modified.  The title is always shown."
-  :type '(choice (repeat (choice (const title) (const tags) (const created) (const modified)))
+\"modified, tags, title, added\".  Names: title, tags, created, added,
+modified.  The title is always shown.  Created is the date a note
+declares, or else its Added date marked `~'.  Added is the earlier of
+the file's creation and modified dates when nvEmacs first found it.
+`nvemacs-notelist-column-toggle' changes the columns for the session."
+  :type '(choice (repeat (choice (const title) (const tags) (const created)
+                                 (const added) (const modified)))
                  string))
 
 (defcustom nvemacs-notelist-preview t
@@ -2133,12 +2447,35 @@ nil: no limit."
 (defvar-local nvemacs--layout nil
   "Columns of the last draw: ((COLUMN START WIDTH) ...).")
 
-(defconst nvemacs--column-names '(title tags created modified))
+(defconst nvemacs--column-names '(title tags created added modified)
+  "Every column, in the standard order.")
 
 (defvar nvemacs--columns-warned nil
   "The `nvemacs-notelist-columns' value last warned about (warn once).")
 
+(defvar nvemacs--columns-now nil
+  "The columns the toggles set for this session; nil: the preference.")
+
+(defvar nvemacs--sort (cons 'modified 'desc)
+  "The notelist's sort: (COLUMN . DIRECTION), DIRECTION `asc' or `desc'.")
+
+(defvar-local nvemacs--sort-keys nil
+  "Hash table ID -> sort key of every listed note, once its order is known.
+nil while the list is read newest first, a screenful at a time.")
+
+(defvar-local nvemacs--rest nil
+  "Ids of the listed notes not drawn yet, in list order.
+Used when `nvemacs--sort-keys' is set.")
+
+(defvar-local nvemacs--list-stale nil
+  "Non-nil while a stopped sort pass waits to run again.
+The rows on screen then belong to the previous search, so none are added.")
+
 (defun nvemacs--notelist-column-list ()
+  "The columns to draw: this session's toggles, or the preference."
+  (or nvemacs--columns-now (nvemacs--notelist-column-preference)))
+
+(defun nvemacs--notelist-column-preference ()
   "`nvemacs-notelist-columns' as a list of known symbols, title included."
   (let* ((v nvemacs-notelist-columns)
          (names (mapcar (lambda (n) (intern (downcase (string-trim (format "%s" n)))))
@@ -2160,18 +2497,18 @@ nil: no limit."
 
 (defun nvemacs--notelist-layout (width tags cols)
   "Columns COLS laid out in a row WIDTH columns wide with tags TAGS wide:
-\((COLUMN START WIDTH) ...).  Dates are fixed (modified 10, created 11 for
-its `~'); the title takes the rest.  A title narrower than
+\((COLUMN START WIDTH) ...).  Dates are fixed (modified and added 10,
+created 11 for its `~'); the title takes the rest.  A title narrower than
 `nvemacs-notelist-title-min-width' first shrinks tags toward their
-minimum, then drops tags, created, modified in that order."
+minimum, then drops tags, created, added, modified in that order."
   (let* ((cs cols)
-         (fixed (lambda (c) (pcase c ('modified 10) ('created 11) ('tags tags) (_ 0))))
+         (fixed (lambda (c) (pcase c ((or 'modified 'added) 10) ('created 11) ('tags tags) (_ 0))))
          (title-w (lambda () (- width (apply #'+ (mapcar fixed (remq 'title cs)))
                                 (* 2 (1- (length cs))))))
          (tmin nvemacs-notelist-title-min-width))
     (when (and (memq 'tags cs) (< (funcall title-w) tmin))
       (setq tags (max nvemacs-notelist-tags-min-width (- tags (- tmin (funcall title-w))))))
-    (dolist (c '(tags created modified))
+    (dolist (c '(tags created added modified))
       (when (and (memq c cs) (< (funcall title-w) tmin))
         (setq cs (remq c cs))))
     (let ((x 0) (out nil))
@@ -2222,7 +2559,7 @@ a grey (untitled)."
 (defun nvemacs--cell (entry _id row)
   "Return the text of column ENTRY for a note whose data is ROW.
 ENTRY is (COLUMN START WIDTH), and ROW is (TITLE MTIME PREVIEW CREATED
-CGUESS TAGS-TEXT).  Every cell after the first starts at its column by
+CGUESS TAGS-TEXT ADDED).  Every cell after the first starts at its column by
 :align-to (pixels: fallback CJK fonts draw Hangul narrower than the 2
 columns `string-width' counts)."
   (pcase-let ((`(,col ,start ,w) entry))
@@ -2233,17 +2570,32 @@ columns `string-width' counts)."
               ('modified (nvemacs--date-text (/ (float (nth 1 row)) nvemacs--rowid-units-per-second)))
               ('created (if (nth 3 row)
                             (concat (if (eql (nth 4 row) 1) "~" " ") (nvemacs--date-text (nth 3 row)))
-                          ""))))))
+                          ""))
+              ('added (if (nth 6 row) (nvemacs--date-text (nth 6 row)) ""))))))
+
+(defun nvemacs--sort-triangle ()
+  "▲ for A to Z or oldest first, ▼ for Z to A or newest first."
+  (if (eq (cdr nvemacs--sort) 'asc) "▲" "▼"))
+
+(defun nvemacs--heading (column)
+  "Return the heading of COLUMN, with a triangle if the list is sorted by it."
+  (propertize (concat (pcase column
+                        ('title "Title") ('tags "Tags") ('created " Created")
+                        ('added "Added") ('modified "Modified"))
+                      (if (eq column (car nvemacs--sort))
+                          (concat " " (nvemacs--sort-triangle))
+                        ""))
+              'nvemacs-column column
+              'mouse-face 'highlight
+              'help-echo "mouse-1: sort by this column; again to reverse"))
 
 (defun nvemacs--headings ()
   "Return the header line: the column headings.
-They sit at the column positions of the last draw, with ▼ on the sort
-column."
+They sit at the column positions of the last draw, with a triangle on
+the sort column."
   (mapconcat (lambda (e)
                (concat (propertize " " 'display `(space :align-to ,(nth 1 e)))
-                       (pcase (car e)
-                         ('title "Title") ('tags "Tags")
-                         ('created " Created") ('modified "Modified ▼"))))
+                       (nvemacs--heading (car e))))
              nvemacs--layout ""))
 
 (defun nvemacs--state-file ()
@@ -2363,43 +2715,59 @@ The width is saved in your Customize file, with
             (puthash id t seen) (push id todo) (cl-decf room))))
       (setq todo (nreverse todo))
       (let ((data (nvemacs--row-data db todo (assq 'tags layout))))
-        (save-excursion
-          (goto-char (point-max))
-          (dolist (id todo)
-            (let ((row (gethash id data)))
-              (when row
-                (puthash id t nvemacs--shown-set)
-                (push id added)
-                (insert (nvemacs--row-text id row layout)))))))
+        (when todo
+          (save-excursion
+            (nvemacs--rows-open)
+            (goto-char (point-max))
+            (dolist (id todo)
+              (let ((row (gethash id data)))
+                (when row
+                  (puthash id t nvemacs--shown-set)
+                  (push id added)
+                  (insert (nvemacs--row-text id row layout)))))
+            (nvemacs--rows-close))))
       (setq nvemacs--shown (nconc nvemacs--shown (nreverse added))))
     (nvemacs--note-first-row)))
 
 (defun nvemacs--row-data (db ids tags)
   "Return a hash table of the row data of IDS, read from index DB.
-Each entry is ID -> (TITLE MTIME PREVIEW CREATED CGUESS TAGS-TEXT),
+Each entry is ID -> (TITLE MTIME PREVIEW CREATED CGUESS TAGS-TEXT ADDED),
 read a batch at a time (two queries per row cost ~65 ms of a 4,783-row
 redraw, measured 2026-11-20).  With TAGS nil, no tags are read.  A
-note's tags are listed file tags first, as `nvemacs--tags-text' does."
-  (let ((h (make-hash-table :size (max 1 (length ids)))))
+note's tags are listed file tags first, as `nvemacs--tags-text' does,
+or alphabetized while the list is sorted by tags, so a row's place
+makes sense."
+  (let ((h (make-hash-table :size (max 1 (length ids))))
+        ;; Only a list ordered by tags: the kept copy is always newest first.
+        (tag-order (if (and nvemacs--sort-keys (eq (car nvemacs--sort) 'tags))
+                       "folded, rowid"
+                     "kind = 'section', rowid")))
     (while ids
       (let* ((chunk (seq-take ids 500))
              (marks (mapconcat (lambda (_) "?") chunk ",")))
         (setq ids (nthcdr 500 ids))
-        (dolist (r (sqlite-select db (format "SELECT id, title, mtime, preview, created, cguess FROM meta WHERE id IN (%s)" marks)
+        (dolist (r (sqlite-select db (format "SELECT id, title, mtime, preview, created, cguess, added FROM meta WHERE id IN (%s)" marks)
                                   chunk))
-          (puthash (car r) (append (cdr r) (list nil)) h))
+          (pcase-let ((`(,id ,title ,mtime ,preview ,created ,cguess ,added) r))
+            (puthash id (list title mtime preview created cguess nil added) h)))
         (when tags
-          (dolist (r (sqlite-select db (format "SELECT id, tag FROM tags WHERE id IN (%s) ORDER BY id, kind = 'section', rowid" marks)
+          (dolist (r (sqlite-select db (format "SELECT id, tag FROM tags WHERE id IN (%s) ORDER BY id, %s" marks tag-order)
                                     chunk))
             (let ((row (gethash (car r) h)))
               (when row
                 (setf (nth 5 row) (if (nth 5 row) (concat (nth 5 row) " " (cadr r)) (cadr r)))))))))
     h))
 
+(defconst nvemacs--row-fill (propertize " " 'display '(space :align-to (- right (1))))
+  "The end of every row: it carries the highlight to the window's edge.
+A newline does that for the other rows, but the last row has none.  It
+stops a pixel short so the end of the row stays on screen.")
+
 (defun nvemacs--row-text (id row layout)
   "The list line of note ID: its cells for LAYOUT, from ROW.
 ROW is as `nvemacs--row-data' returns it."
-  (propertize (concat (mapconcat (lambda (e) (nvemacs--cell e id row)) layout "") "\n")
+  (propertize (concat (mapconcat (lambda (e) (nvemacs--cell e id row)) layout "")
+                      nvemacs--row-fill "\n")
               'read-only t 'nvemacs-id id))
 
 (defun nvemacs--clear-rows ()
@@ -2407,6 +2775,34 @@ ROW is as `nvemacs--row-data' returns it."
   (let ((inhibit-read-only t))
     (delete-region nvemacs--rows-start (point-max))
     (setq nvemacs--shown nil nvemacs--shown-set nil)))
+
+;; The list ends at its last row: a newline there would be a blank line the
+;; cursor and the mouse could land on, with no note selected.
+;; Every row is drawn with its newline, so code that adds or removes rows opens
+;; the end of the list first and closes it after.
+
+(defun nvemacs--rows-open ()
+  "Give the last row its newline back, before rows are added or removed."
+  (when (and (> (point-max) nvemacs--rows-start)
+             (not (eq (char-before (point-max)) ?\n)))
+    (let ((inhibit-read-only t)
+          (id (get-text-property (1- (point-max)) 'nvemacs-id)))
+      (save-excursion
+        (goto-char (point-max))
+        (insert (propertize "\n" 'read-only t 'nvemacs-id id))))))
+
+(defun nvemacs--rows-close ()
+  "Remove the newline after the last row."
+  (when (and (> (point-max) nvemacs--rows-start)
+             (eq (char-before (point-max)) ?\n))
+    (let ((inhibit-read-only t))
+      (delete-region (1- (point-max)) (point-max)))))
+
+(defun nvemacs--row-at (pos)
+  "Return the id of the note whose row holds POS, or nil."
+  (and (>= pos nvemacs--rows-start)
+       (get-text-property (save-excursion (goto-char pos) (line-beginning-position))
+                          'nvemacs-id)))
 
 ;;;; Updating rows in place
 ;;
@@ -2430,34 +2826,82 @@ ROW is as `nvemacs--row-data' returns it."
              (while (and (cdr cell) (not (eql (cadr cell) before))) (setq cell (cdr cell)))
              (setcdr cell (cons new (cdr cell)))))))
 
+;; A typed search in the default sort lists title matches, then the other
+;; matches, each group newest first.
+
+(defconst nvemacs--title-rank (ash 1 60)
+  "Added to a title match's sort key, to put it above every other match.")
+
+(defun nvemacs--typed-key (id titles)
+  "Return note ID's sort key in a typed search in the default sort.
+TITLES is a hash table holding the ids of the title matches."
+  (if (gethash id titles) (+ id nvemacs--title-rank) id))
+
+(defun nvemacs--title-matches (db ids)
+  "Return a hash table of those IDS whose title matches the typed search.
+DB is the index."
+  (let ((terms (car (nvemacs--parse-query (nvemacs--search-text))))
+        (found (make-hash-table)))
+    (when terms
+      (let ((table (car (nvemacs--route terms)))
+            (match (nvemacs--term-where terms)))
+        (while ids
+          (let* ((chunk (seq-take ids 500))
+                 (marks (mapconcat (lambda (_) "?") chunk ",")))
+            (setq ids (nthcdr 500 ids))
+            (dolist (r (sqlite-select db (format "SELECT rowid FROM %s WHERE rowid IN (%s) AND %s"
+                                                 table marks (car match))
+                                      (append chunk (cdr match))))
+              (puthash (car r) t found))))))
+    found))
+
+(defun nvemacs--place-in-default-sort (db new newest)
+  "Return the listed row that note NEW goes above, or nil for the end.
+DB is the index.  A NEWEST list is in date order; a typed search keeps
+title matches above the others."
+  (if newest
+      (cl-find-if (lambda (id) (< id new)) nvemacs--shown)
+    (let* ((titles (nvemacs--title-matches db (cons new nvemacs--shown)))
+           (key (nvemacs--typed-key new titles)))
+      (cl-find-if (lambda (id) (< (nvemacs--typed-key id titles) key)) nvemacs--shown))))
+
 (defun nvemacs--rows-apply (changes newest filter)
   "Show index CHANGES, ((OLD-ID . NEW-ID) ...), in the current list.
-OLD's row is taken out and NEW's row is drawn: where OLD's was in a
-word search, or at its place by date in a NEWEST list (one without
-words, narrowed by tag FILTER, see `nvemacs--tag-filter').  A NEW not
-listed in a word search waits for the next search; one not listed and
-older than every listed row waits for growth.  Return the list of
-\(OLD . NEW) whose row moved or went."
+OLD's row is taken out and NEW's row is drawn at its place by date,
+normally the top of its group (a word search lists title matches
+first).  A word search shows what it found: a NEW it did not
+list waits for the next search, and a listed note stays listed even if
+it no longer matches.  In a NEWEST list (one without words, narrowed by
+tag FILTER, see `nvemacs--tag-filter') a NEW the filter excludes goes,
+and one not listed and older than every listed row waits for growth.
+Return the list of (OLD . NEW) whose row moved or went."
   (let ((db (nvemacs--db)) (inhibit-read-only t) (moved nil))
     (unless nvemacs--shown-set (setq nvemacs--shown-set (make-hash-table)))
+    (nvemacs--rows-open)
     (dolist (c changes)
       (let* ((old (car c)) (new (cdr c))
              (pos (and old (nvemacs--row-pos old)))
-             (next (and pos (cadr (memq old nvemacs--shown))))
+             (waiting (and old (memq old nvemacs--rest) t))
              (before nil) (draw nil))
         (when pos
           (delete-region pos (save-excursion (goto-char pos) (forward-line 1) (point)))
           (remhash old nvemacs--shown-set)
           (setq nvemacs--shown (delq old nvemacs--shown)))
+        (when waiting (setq nvemacs--rest (delq old nvemacs--rest)))
+        (when (and old nvemacs--sort-keys) (remhash old nvemacs--sort-keys))
         (when (and new (not (gethash new nvemacs--shown-set)))
           (cond
-           ((not newest) (when pos (setq draw t before next)))
-           ((not (caar (sqlite-select db (format "SELECT 1 FROM meta WHERE id = ?%s" (car filter))
-                                      (cons new (cdr filter))))))
+           ((if newest
+                (not (caar (sqlite-select db (format "SELECT 1 FROM meta WHERE id = ?%s" (car filter))
+                                          (cons new (cdr filter)))))
+              (not (or pos waiting))))
+           (nvemacs--sort-keys
+            (pcase-let ((`(,at . ,now) (nvemacs--sort-place db new pos)))
+              (setq before at draw now)))
            ((null nvemacs--shown) (setq draw t))
            ;; A listed note stays listed (at the end if nothing listed is
            ;; older); one not listed and older than every row waits for growth.
-           (t (setq before (cl-find-if (lambda (id) (< id new)) nvemacs--shown)
+           (t (setq before (nvemacs--place-in-default-sort db new newest)
                     draw (or before pos)))))
         (when draw
           (let ((row (gethash new (nvemacs--row-data db (list new) (assq 'tags nvemacs--layout)))))
@@ -2467,6 +2911,7 @@ older than every listed row waits for growth.  Return the list of
                 (insert (nvemacs--row-text new row nvemacs--layout)))
               (nvemacs--shown-insert new before))))
         (when (or pos draw) (push c moved))))
+    (nvemacs--rows-close)
     (nreverse moved)))
 
 (defun nvemacs--list-update (changes &optional patch-kept)
@@ -2481,13 +2926,13 @@ patched the same way; otherwise it is let go."
       (with-current-buffer buf
         (pcase-let* ((`(,terms ,inc ,exc) (nvemacs--parse-query (nvemacs--search-text)))
                      (wins (get-buffer-window-list buf nil t))
-                     (at (lambda (p) (and (>= p nvemacs--rows-start) (< p (point-max))
-                                          (get-text-property p 'nvemacs-id))))
-                     (here (funcall at (point)))
-                     (win-ids (mapcar (lambda (w) (cons w (funcall at (window-point w)))) wins))
+                     (here (nvemacs--row-at (point)))
+                     (win-ids (mapcar (lambda (w) (cons w (nvemacs--row-at (window-point w)))) wins))
                      (moved (nvemacs--rows-apply changes (null terms) (nvemacs--tag-filter inc exc)))
                      (follow (lambda (id) (let ((m (assq id moved))) (if m (cdr m) id))))
                      (go (lambda (id) (and id (nvemacs--row-pos (funcall follow id))))))
+          (when nvemacs--selected-id    ; a save gives the note a new id
+            (setq nvemacs--selected-id (funcall follow nvemacs--selected-id)))
           (let ((p (funcall go here))) (when p (goto-char p)))
           (dolist (w win-ids)
             (let ((p (funcall go (cdr w))))
@@ -2497,14 +2942,37 @@ patched the same way; otherwise it is let go."
               (cond ((null now) (nvemacs--restore-typed))
                     ((not (eql now nvemacs--selected-title))
                      (nvemacs--put-selected-title now)))))
-          (when (null terms) (nvemacs--landing-status inc exc)))))))
+          (when (and nvemacs--view-free hl-line-mode) (hl-line-highlight))
+          (cond ((null terms) (nvemacs--landing-status inc exc))
+                (nvemacs--sort-keys (nvemacs--list-status terms inc exc))))))))
 
 (defun nvemacs--set-status (fmt &rest args)
   "Set the list's status text to (format FMT ARGS...) and show it."
-  (setq nvemacs--status (apply #'format fmt args))
+  (setq nvemacs--status-base (apply #'format fmt args))
+  (nvemacs--status-show))
+
+(defun nvemacs--status-show ()
+  "Show the status text, naming the sort when its column is not on screen."
+  (setq nvemacs--status
+        (concat nvemacs--status-base
+                (if (assq (car nvemacs--sort) nvemacs--layout)
+                    ""
+                  (format " · sorted by %s %s" (car nvemacs--sort) (nvemacs--sort-triangle)))))
   (force-mode-line-update))
 
 (defun nvemacs--search ()
+  "Run the current query in the current sort; the selection survives it."
+  (let* ((id (nvemacs--selection))
+         (free nvemacs--view-free)
+         (starts (and free (mapcar (lambda (w) (cons w (line-number-at-pos (window-start w))))
+                                   (get-buffer-window-list (current-buffer) nil t)))))
+    (if (equal nvemacs--sort '(modified . desc))
+        (progn (setq nvemacs--sort-keys nil nvemacs--rest nil nvemacs--list-stale nil)
+               (nvemacs--search-newest))
+      (nvemacs--search-sorted))
+    (nvemacs--selection-restore id free starts)))
+
+(defun nvemacs--search-newest ()
   "Run the current query, drawing the matching rows as they arrive.
 Titles are searched first, then bodies in adaptive rowid slices.  The
 search stops when the screen is full, the range is exhausted, or a key
@@ -2557,12 +3025,12 @@ is pressed."
              (span (max 1 (- top bottom)))
              (r (1+ top))
              (d (max 1 (/ span nvemacs--slice-start-fraction)))
-             (stopped nil))
-        ;; Title phase: small table, newest first.
-        (nvemacs--insert-rows
-         (mapcar #'car (sqlite-select db (format "SELECT rowid FROM %s WHERE %s ORDER BY rowid DESC LIMIT ?"
-                                                 (car route) where)
-                                      (append args (list want)))))
+             (stopped nil)
+             ;; Title phase: small table, newest first.
+             (titles (mapcar #'car (sqlite-select db (format "SELECT rowid FROM %s WHERE %s ORDER BY rowid DESC LIMIT ?"
+                                                             (car route) where)
+                                                  (append args (list want))))))
+        (nvemacs--insert-rows titles)
         (funcall first-row)
         (redisplay)
         ;; Body phase: adaptive slices.
@@ -2591,6 +3059,16 @@ is pressed."
                                    (/ (* 100 (- top r)) span) (cdr route))
               (redisplay))
             (when (input-pending-p) (setq stopped t))))
+        ;; Every match is on screen: growth has nothing left to read.
+        (when (and (not stopped) (< (length nvemacs--shown) want))
+          (let ((rank (make-hash-table)))
+            (dolist (id titles) (puthash id t rank))
+            (setq nvemacs--sort-keys (make-hash-table))
+            (dolist (id nvemacs--shown)
+              (puthash id (nvemacs--typed-key id rank) nvemacs--sort-keys))))
+        ;; A key stopped it before any row: growth needs a row to follow, and
+        ;; a cursor key would not search again.
+        (when (and stopped (null nvemacs--shown)) (nvemacs--schedule-search))
         (nvemacs--set-status " %d shown%s · %s · %.0f ms"
                              (length nvemacs--shown)
                              (cond (stopped " · interrupted")
@@ -2710,7 +3188,9 @@ filters INC and EXC."
                                                (mapcar (lambda (v) (concat "-tag:" v)) exc))
                             " ")
                  " displayed%s")
-       " %s of %s Newest notes displayed · type to search%s")
+       (if (equal nvemacs--sort '(modified . desc))
+           " %s of %s Newest notes displayed · type to search%s"
+         " %s of %s notes displayed · type to search%s"))
      (nvemacs--group-digits (length nvemacs--shown))
      (nvemacs--group-digits
       (or (caar (sqlite-select (nvemacs--db)
@@ -2721,12 +3201,22 @@ filters INC and EXC."
          (format " · %d not indexed" (length nvemacs--skipped)) ""))))
 
 (defun nvemacs--grow ()
-  "Append the next screenful of older notes below the list.
-This happens only with an empty search.  Return the number of rows
-added, or nil when there is nothing to do (a typed search, or every
-note already listed)."
+  "Append the next screenful of notes below the list.
+Return the number of rows added, or nil when there is nothing to do
+\(every note listed, or a key was pressed while matches were read)."
   (pcase-let ((`(,terms ,inc ,exc) (nvemacs--parse-query (nvemacs--search-text))))
-    (when (and nvemacs--shown (null terms))        ; newest notes, or a tag-only list
+    (cond
+     ((or (null nvemacs--shown) nvemacs--list-stale) nil)
+     ;; A typed search in the default sort: its first growth finds the rest.
+     ((and terms (null nvemacs--sort-keys)
+           (not (nvemacs--read-typed-rest terms inc exc)))
+      nil)
+     (nvemacs--sort-keys
+      (let ((added (nvemacs--rest-draw (nvemacs--screen-rows))))
+        (when (> added 0)
+          (nvemacs--list-status terms inc exc)
+          added)))
+     (t                                 ; newest notes, or a tag-only list
       (let ((before (length nvemacs--shown))
             (filter (nvemacs--tag-filter inc exc)))
         (nvemacs--insert-rows
@@ -2741,7 +3231,18 @@ note already listed)."
           (if (> added 0)
               (progn (nvemacs--landing-status inc exc) added)
             (unless (or inc exc) (nvemacs--keep-list))   ; every note is listed
-            nil))))))
+            nil)))))))
+
+(defconst nvemacs--grow-margin 3
+  "Rows from the end of the list at which the next screenful loads at once.")
+
+(defun nvemacs--grow-near-bottom ()
+  "Load more rows now if the cursor is close to the last row.
+Waiting for idle time would stop the cursor at the end of what is drawn.
+`nvemacs-grow-delay' nil keeps the list at one screenful."
+  (when (and nvemacs-grow-delay nvemacs--shown (not (nvemacs--in-query-p))
+             (save-excursion (forward-line nvemacs--grow-margin) (eobp)))
+    (nvemacs--grow)))
 
 (defun nvemacs--grow-tick ()
   "Grow the list by one step while the cursor is in it.
@@ -2768,6 +3269,425 @@ chain."
   (dolist (tm (list nvemacs--grow-timer nvemacs--grow-chain)) (when tm (cancel-timer tm)))
   (setq nvemacs--grow-timer nil nvemacs--grow-chain nil))
 
+;;;; Sorting the notelist
+;;
+;; Modified, newest first, is the order rows are stored in, so that list
+;; fills as it is read. In any other order a row cannot be trusted until
+;; every match is known: refreshing while reading changed the screen up to
+;; 160 times and was final only after 91-100% of the matches (measured
+;; 2026-11-22). So all matches are found and ordered once (4-119 ms for 35
+;; to 36,694 matches), the first screen is drawn, and later rows are only
+;; added below. The read goes in slices, so a key stops it with the old
+;; list still up.
+
+(defconst nvemacs--column-keys
+  '((?a . title) (?b . tags) (?c . created) (?d . added) (?e . modified))
+  "The letters of the sort and column menus.")
+
+(defun nvemacs--sort-sql (column)
+  "Return the `meta' field that orders COLUMN."
+  (pcase column
+    ('title "title_key") ('tags "tags_key") ('created "created") ('added "added") (_ "id")))
+
+(defun nvemacs--match-pairs (terms filter column &optional titles)
+  "Return every note matching TERMS and tag FILTER, as ((ID KEY) ...).
+KEY is the note's sort key for COLUMN, and the list is newest first.
+With TITLES, only notes whose title matches.  Text searches read in
+adaptive slices; if a key is pressed before the last one, return
+`interrupted'."
+  (let ((db (nvemacs--db)) (key (nvemacs--sort-sql column)))
+    (if (null terms)
+        (sqlite-select db (format "SELECT id, %s FROM meta WHERE 1%s ORDER BY id DESC" key (car filter))
+                       (cdr filter))
+      (let* ((route (nvemacs--route terms))
+             (table (if titles (car route) (cdr route)))
+             (match (nvemacs--term-where terms))
+             (where (concat (car match) (car filter)))
+             (args (append (cdr match) (cdr filter)))
+             (top (or (caar (sqlite-select db "SELECT max(id) FROM meta")) 0))
+             (bottom (or (caar (sqlite-select db "SELECT min(id) FROM meta")) 0))
+             (span (max 1 (- top bottom)))
+             (r (1+ top))
+             (d (max 1 (/ span nvemacs--slice-start-fraction)))
+             (t0 (float-time))
+             (chunks nil) (stopped nil))
+        (while (and (> r bottom) (not stopped))
+          (let* ((lo (max bottom (- r d)))
+                 (c0 (float-time))
+                 (rows (sqlite-select
+                        db (format "SELECT id, %s FROM meta WHERE id IN (SELECT rowid FROM %s WHERE rowid < ? AND rowid >= ? AND %s) ORDER BY id DESC"
+                                   key table where)
+                        (append (list r lo) args)))
+                 (ms (* 1000 (- (float-time) c0))))
+            (setq r (if (= lo bottom) (1- bottom) lo))
+            (setq d (cond ((< ms nvemacs--slice-fast-ms) (* d 2))
+                          ((> ms nvemacs--slice-slow-ms) (max 1 (/ d 2)))
+                          (t d)))
+            (when rows (push rows chunks))
+            (when (> r bottom)
+              (if (input-pending-p)
+                  (setq stopped t)
+                (when (> (- (float-time) t0) 0.1)     ; only a slow pass says so
+                  (nvemacs--set-status " sorting… %d%%" (/ (* 100 (- top r)) span))
+                  (redisplay))))))
+        (if stopped 'interrupted (apply #'nconc (nreverse chunks)))))))
+
+(defun nvemacs--sort-order (pairs)
+  "Return the ids of PAIRS, ((ID KEY) ...) newest first, in the current sort.
+Blank keys go last in both directions.  The sort is stable, so ties stay
+newest first."
+  (let ((asc (eq (cdr nvemacs--sort) 'asc)) (filled nil) (blank nil))
+    (dolist (p pairs)
+      (if (member (cadr p) '(nil "")) (push (car p) blank) (push p filled)))
+    (setq filled (nreverse filled))
+    (nconc (mapcar #'car
+                   (sort filled
+                         (if (stringp (cadr (car filled)))
+                             (if asc
+                                 (lambda (a b) (string< (cadr a) (cadr b)))
+                               (lambda (a b) (string< (cadr b) (cadr a))))
+                           (if asc
+                               (lambda (a b) (< (cadr a) (cadr b)))
+                             (lambda (a b) (> (cadr a) (cadr b)))))))
+           (nreverse blank))))
+
+(defun nvemacs--sort-before-p (a b)
+  "Return non-nil if the note with id A sorts before the one with id B."
+  (let ((ka (gethash a nvemacs--sort-keys)) (kb (gethash b nvemacs--sort-keys)))
+    (cond ((member kb '(nil "")) (or (not (member ka '(nil ""))) (> a b)))
+          ((member ka '(nil "")) nil)
+          ((equal ka kb) (> a b))
+          ((stringp ka) (if (eq (cdr nvemacs--sort) 'asc) (string< ka kb) (string< kb ka)))
+          ((eq (cdr nvemacs--sort) 'asc) (< ka kb))
+          (t (> ka kb)))))
+
+(defun nvemacs--rest-draw (n)
+  "Draw the next N rows of the ordered list; return how many were added."
+  (let ((before (length nvemacs--shown))
+        (next (seq-take nvemacs--rest n)))
+    (setq nvemacs--rest (nthcdr n nvemacs--rest))
+    (nvemacs--insert-rows next)
+    (- (length nvemacs--shown) before)))
+
+(defun nvemacs--rest-insert (id)
+  "Put ID at its place among the rows not drawn yet."
+  (if (or (null nvemacs--rest) (nvemacs--sort-before-p id (car nvemacs--rest)))
+      (push id nvemacs--rest)
+    (let ((cell nvemacs--rest))
+      (while (and (cdr cell) (not (nvemacs--sort-before-p id (cadr cell))))
+        (setq cell (cdr cell)))
+      (setcdr cell (cons id (cdr cell))))))
+
+(defun nvemacs--sort-place (db new was-drawn)
+  "Find where note NEW, read from DB, goes in an ordered list.
+Return (BEFORE . DRAW): BEFORE is the row to draw it above (nil: the
+end), DRAW non-nil to draw it.  A note that belongs below the rows drawn
+so far waits with them, unless WAS-DRAWN: then the rows down to it are
+drawn, so the cursor keeps it."
+  (puthash new (if (equal nvemacs--sort '(modified . desc)) ; here, always a typed search
+                   (nvemacs--typed-key new (nvemacs--title-matches db (list new)))
+                 (caar (sqlite-select db (format "SELECT %s FROM meta WHERE id = ?"
+                                                 (nvemacs--sort-sql (car nvemacs--sort)))
+                                      (list new))))
+           nvemacs--sort-keys)
+  (let ((before (cl-find-if (lambda (id) (nvemacs--sort-before-p new id)) nvemacs--shown)))
+    (cond (before (cons before t))
+          ((null nvemacs--rest) (cons nil t))
+          (t (nvemacs--rest-insert new)
+             (when was-drawn (nvemacs--rest-draw (1+ (cl-position new nvemacs--rest))))
+             (cons nil nil)))))
+
+(defun nvemacs--read-typed-rest (terms inc exc)
+  "Order the matches of a typed search in the default sort, for growth.
+TERMS, INC and EXC are the parsed search.  The rows already drawn stay;
+the others follow them, title matches and then the rest, each newest
+first.  Return non-nil unless a key stopped the read."
+  (let* ((status nvemacs--status-base)
+         (filter (nvemacs--tag-filter inc exc))
+         (titles (nvemacs--match-pairs terms filter 'modified t))
+         (pairs (if (eq titles 'interrupted)
+                    titles
+                  (nvemacs--match-pairs terms filter 'modified))))
+    (if (eq pairs 'interrupted)
+        (progn (nvemacs--set-status "%s" status) nil)
+      (let ((keys (make-hash-table :size (max 1 (+ (length titles) (length pairs)))))
+            (rank (make-hash-table :size (max 1 (length titles)))))
+        (dolist (p titles) (puthash (car p) t rank))
+        (dolist (p (append titles pairs))
+          (puthash (car p) (nvemacs--typed-key (car p) rank) keys))
+        (dolist (id nvemacs--shown) (puthash id (nvemacs--typed-key id rank) keys))
+        (setq nvemacs--sort-keys keys
+              nvemacs--rest
+              (nconc (cl-loop for p in titles
+                              unless (gethash (car p) nvemacs--shown-set)
+                              collect (car p))
+                     (cl-loop for p in pairs
+                              unless (or (gethash (car p) rank)
+                                         (gethash (car p) nvemacs--shown-set))
+                              collect (car p))))
+        (nvemacs--set-status "%s" status)
+        t))))
+
+(defun nvemacs--list-status (terms inc exc)
+  "Show how much of an ordered list is drawn.
+TERMS, INC and EXC are the parsed search."
+  (if terms
+      (nvemacs--set-status " %s of %s matches displayed"
+                           (nvemacs--group-digits (length nvemacs--shown))
+                           (nvemacs--group-digits (+ (length nvemacs--shown)
+                                                     (length nvemacs--rest))))
+    (nvemacs--landing-status inc exc)))
+
+(defun nvemacs--search-sorted ()
+  "Run the current query in a column sort.
+Every match is found and ordered before the list changes.  A key
+pressed meanwhile leaves the old list up, and the search runs again."
+  (setq nvemacs--rendered-size (nvemacs--window-size))
+  (nvemacs--ensure-match-width)
+  (when nvemacs--session
+    (setq nvemacs--session (plist-put nvemacs--session :searches
+                                      (1+ (plist-get nvemacs--session :searches)))))
+  (pcase-let* ((query (nvemacs--search-text))
+               (`(,terms ,inc ,exc) (nvemacs--parse-query query))
+               (want (nvemacs--screen-rows))
+               (before (length nvemacs--shown))
+               (t0 (float-time))
+               (pairs (nvemacs--match-pairs terms (nvemacs--tag-filter inc exc)
+                                            (car nvemacs--sort)))
+               (stopped (eq pairs 'interrupted)))
+    (if stopped
+        (progn
+          (setq nvemacs--list-stale t)
+          (nvemacs--set-status " %d shown · interrupted" before)
+          (nvemacs--schedule-search))
+      (let ((keys (make-hash-table :size (max 1 (length pairs)))))
+        (dolist (p pairs) (puthash (car p) (cadr p) keys))
+        (nvemacs--clear-rows)
+        (setq nvemacs--list-stale nil
+              nvemacs--sort-keys keys
+              nvemacs--rest (nvemacs--sort-order pairs))
+        (nvemacs--rest-draw (max want before))
+        (nvemacs--list-status terms inc exc)))
+    (setq nvemacs--last-search
+          (list :query query :terms (length terms) :route "sorted"
+                :rows (length nvemacs--shown) :want want
+                :first-row-ms (nvemacs--ms t0) :ms (nvemacs--ms t0)
+                :outcome (if stopped "interrupted" "listed")
+                :when (format-time-string "%F %T")))))
+
+(defun nvemacs--show-id (id)
+  "Draw rows until note ID is listed, and put point on it if it is."
+  (cl-flet ((drawn () (and nvemacs--shown-set (gethash id nvemacs--shown-set))))
+    (while (and (not (drawn)) (not nvemacs--sort-keys) (nvemacs--grow)))
+    (unless (drawn)
+      (let ((i (cl-position id nvemacs--rest)))
+        (when i (nvemacs--rest-draw (1+ i)))))
+    (let ((p (nvemacs--row-pos id))) (when p (goto-char p)))))
+
+(defun nvemacs--sort-apply ()
+  "Redraw the list in the current sort and go to the selected note.
+A new order makes a scrolled view meaningless.  A window in another
+frame stays on the note it was on."
+  (let* ((id (nvemacs--selection))
+         (others (cl-loop for w in (get-buffer-window-list (current-buffer) nil t)
+                          unless (eq (window-frame w) (selected-frame))
+                          collect (cons w (nvemacs--row-at (window-point w))))))
+    (nvemacs--view-free-set nil)
+    (setq nvemacs--selected-id id)
+    (if id
+        (nvemacs--show-id id)
+      (goto-char nvemacs--query-start)
+      (end-of-line))
+    (nvemacs--search)
+    (dolist (w others)
+      (when (cdr w)
+        (save-excursion (nvemacs--show-id (cdr w)))
+        (let ((p (nvemacs--row-pos (cdr w)))) (when p (set-window-point (car w) p)))))
+    (force-mode-line-update t)))
+
+(defun nvemacs--notelist-check (command)
+  "Signal an error from COMMAND unless the notelist exists."
+  (unless (get-buffer nvemacs--buffer-name)
+    (nvemacs--command-error command "requires the nvEmacs notelist"
+                            "Run M-x nvemacs and then re-run the command")))
+
+(defun nvemacs--sort-start ()
+  "Set the sort remembered in state.eld, or the default."
+  (let ((s (alist-get 'sort (nvemacs--state-read))))
+    (setq nvemacs--sort
+          (if (and (consp s) (memq (car s) nvemacs--column-names) (memq (cdr s) '(asc desc)))
+              s
+            (cons 'modified 'desc)))))
+
+(defun nvemacs--sort-set (sort)
+  "Make SORT, (COLUMN . DIRECTION), the list's sort, and remember it."
+  (setq nvemacs--sort sort)
+  (nvemacs--state-write (cons (cons 'sort sort) (assq-delete-all 'sort (nvemacs--state-read))))
+  (with-current-buffer nvemacs--buffer-name (nvemacs--sort-apply)))
+
+(defun nvemacs--sort-by (column command)
+  "Sort by COLUMN for COMMAND; if the list already is, reverse it.
+A new column starts A to Z (title, tags) or newest first (dates)."
+  (nvemacs--notelist-check command)
+  (nvemacs--sort-set
+   (cons column (cond ((not (eq column (car nvemacs--sort)))
+                       (if (memq column '(title tags)) 'asc 'desc))
+                      ((eq (cdr nvemacs--sort) 'asc) 'desc)
+                      (t 'asc)))))
+
+(defun nvemacs--heading-at (event)
+  "Return the column whose heading mouse EVENT is on, or nil.
+The heading's text says, when the event carries it.  A real first click
+can arrive without it, so the click's position is the fallback."
+  (let* ((pos (event-start event))
+         (where (posn-string pos)))
+    (or (and where (get-text-property (cdr where) 'nvemacs-column (car where)))
+        (let ((x (car (posn-col-row pos))))
+          (with-current-buffer (window-buffer (posn-window pos))
+            (car (cl-find-if (lambda (e) (and (>= x (nth 1 e)) (< x (+ (nth 1 e) (nth 2 e) 2))))
+                             nvemacs--layout)))))))
+
+(defun nvemacs--heading-click (event)
+  "Sort by the column heading clicked in EVENT; click again to reverse."
+  (interactive "e")
+  (let ((column (nvemacs--heading-at event)))
+    (when column (nvemacs--sort-by column 'nvemacs-notelist-sort-column))))
+
+(defun nvemacs-notelist-sort ()
+  "Reverse the notelist's current sort."
+  (interactive)
+  (nvemacs--sort-by (car nvemacs--sort) 'nvemacs-notelist-sort))
+
+(defun nvemacs-notelist-sort-title ()
+  "Sort the notelist by title.  Run it again to reverse the order."
+  (interactive)
+  (nvemacs--sort-by 'title 'nvemacs-notelist-sort-title))
+
+(defun nvemacs-notelist-sort-tags ()
+  "Sort the notelist by tags.  Run it again to reverse the order.
+Each note's tags are alphabetized and compared one at a time."
+  (interactive)
+  (nvemacs--sort-by 'tags 'nvemacs-notelist-sort-tags))
+
+(defun nvemacs-notelist-sort-created ()
+  "Sort the notelist by Created date.  Run it again to reverse the order."
+  (interactive)
+  (nvemacs--sort-by 'created 'nvemacs-notelist-sort-created))
+
+(defun nvemacs-notelist-sort-added ()
+  "Sort the notelist by Added date.  Run it again to reverse the order."
+  (interactive)
+  (nvemacs--sort-by 'added 'nvemacs-notelist-sort-added))
+
+(defun nvemacs-notelist-sort-modified ()
+  "Sort the notelist by Modified date.  Run it again to reverse the order."
+  (interactive)
+  (nvemacs--sort-by 'modified 'nvemacs-notelist-sort-modified))
+
+(defun nvemacs--sort-menu-text ()
+  "Return the prompt of the sort menu, with a triangle on the sorted column."
+  (concat "Sort by: "
+          (mapconcat (lambda (k)
+                       (format "%c) %s%s" (car k) (cdr k)
+                               (if (eq (cdr k) (car nvemacs--sort))
+                                   (concat " " (nvemacs--sort-triangle))
+                                 "")))
+                     nvemacs--column-keys "  ")
+          "  ^) reverse "))
+
+(defun nvemacs-notelist-sort-column ()
+  "Ask for a column and sort the notelist by it.
+One key chooses.  Choosing the sorted column, or ^, reverses the order."
+  (interactive)
+  (nvemacs--notelist-check 'nvemacs-notelist-sort-column)
+  (let ((key (read-char-choice (nvemacs--sort-menu-text)
+                               (cons ?^ (mapcar #'car nvemacs--column-keys)))))
+    (message nil)                       ; Emacs leaves the question and answer up
+    (if (eq key ?^)
+        (nvemacs-notelist-sort)
+      (nvemacs--sort-by (alist-get key nvemacs--column-keys) 'nvemacs-notelist-sort-column))))
+
+;;;; Showing and hiding columns
+
+(defun nvemacs--column-order ()
+  "Return every column in the order it is drawn.
+That is the preference, with the columns it leaves out at their place in
+the standard order."
+  (let ((order (nvemacs--notelist-column-preference)))
+    (dolist (c nvemacs--column-names)
+      (unless (memq c order)
+        (let* ((later (cdr (memq c nvemacs--column-names)))
+               (at (or (cl-position-if (lambda (x) (memq x later)) order) (length order))))
+          (setq order (append (seq-take order at) (list c) (nthcdr at order))))))
+    order))
+
+(defun nvemacs--columns-redraw ()
+  "Draw the list again with the current columns."
+  (with-current-buffer nvemacs--buffer-name
+    (nvemacs--notelist-redraw)
+    (nvemacs--status-show)
+    (force-mode-line-update t)))
+
+(defun nvemacs--column-toggle (column command)
+  "Show or hide COLUMN for this session, for COMMAND."
+  (nvemacs--notelist-check command)
+  (let ((now (nvemacs--notelist-column-list)))
+    (setq nvemacs--columns-now
+          (if (memq column now)
+              (remq column now)
+            (cl-remove-if-not (lambda (c) (or (eq c column) (memq c now)))
+                              (nvemacs--column-order)))))
+  (nvemacs--columns-redraw))
+
+(defun nvemacs-notelist-column-tags-toggle ()
+  "Show or hide the Tags column for this session."
+  (interactive)
+  (nvemacs--column-toggle 'tags 'nvemacs-notelist-column-tags-toggle))
+
+(defun nvemacs-notelist-column-created-toggle ()
+  "Show or hide the Created column for this session."
+  (interactive)
+  (nvemacs--column-toggle 'created 'nvemacs-notelist-column-created-toggle))
+
+(defun nvemacs-notelist-column-added-toggle ()
+  "Show or hide the Added column for this session."
+  (interactive)
+  (nvemacs--column-toggle 'added 'nvemacs-notelist-column-added-toggle))
+
+(defun nvemacs-notelist-column-modified-toggle ()
+  "Show or hide the Modified column for this session."
+  (interactive)
+  (nvemacs--column-toggle 'modified 'nvemacs-notelist-column-modified-toggle))
+
+(defun nvemacs--column-menu-text ()
+  "Return the prompt of the column menu, with a check on each shown column."
+  (let ((now (nvemacs--notelist-column-list)))
+    (concat "Columns: "
+            (mapconcat (lambda (k)
+                         (format "%c) %s%s" (car k) (cdr k) (if (memq (cdr k) now) " ✓" "")))
+                       (cdr nvemacs--column-keys) "  ")
+            "   RET) done ")))
+
+(defun nvemacs-notelist-column-toggle ()
+  "Show or hide notelist columns from a menu, for this session.
+Each key toggles a column at once.  RET ends the menu, and \\[keyboard-quit]
+puts back the columns it started with.  The title is always shown.
+`nvemacs-notelist-columns' sets the columns at launch."
+  (interactive)
+  (nvemacs--notelist-check 'nvemacs-notelist-column-toggle)
+  (let ((start nvemacs--columns-now)
+        (keys (cdr nvemacs--column-keys))
+        (key nil))
+    (condition-case nil
+        (progn
+          (while (not (eq ?\r (setq key (read-char-choice (nvemacs--column-menu-text)
+                                                          (cons ?\r (mapcar #'car keys))))))
+            (nvemacs--column-toggle (alist-get key keys) 'nvemacs-notelist-column-toggle))
+          (message nil))                ; Emacs leaves the question and answer up
+      (quit (setq nvemacs--columns-now start)
+            (nvemacs--columns-redraw)
+            (signal 'quit nil)))))
+
 (defun nvemacs--row-id ()
   "Return the rowid of the note on the current line, or nil."
   (get-text-property (line-beginning-position) 'nvemacs-id))
@@ -2786,15 +3706,16 @@ chain."
 (defun nvemacs-searchbar-clear ()
   "Clear the query."
   (interactive)
-  (setq nvemacs--selected-title nil nvemacs--typed nil)
+  (setq nvemacs--selected-title nil nvemacs--typed nil nvemacs--selected-id nil)
+  (nvemacs--view-free-set nil)
   (let ((inhibit-read-only t))
     (delete-region nvemacs--query-start
                    (save-excursion (goto-char nvemacs--query-start) (line-end-position))))
   (goto-char nvemacs--query-start))
 
 (defun nvemacs--target-path ()
-  "Path of the row at point, or of the first row when point is on the query."
-  (let ((id (if (nvemacs--in-query-p) (car nvemacs--shown) (nvemacs--row-id))))
+  "Path of the selected note, or of the first row when none is selected."
+  (let ((id (if (nvemacs--on-search-line-p) (car nvemacs--shown) (nvemacs--selection))))
     (and id (caar (sqlite-select (nvemacs--db) "SELECT path FROM meta WHERE id = ?" (list id))))))
 
 ;;;; Layout
@@ -2846,6 +3767,7 @@ your windows as they are and only shows the list."
   :type '(choice (const rebuild) (const respect)))
 
 (defconst nvemacs--placeholder-name "*nvEmacs: no note*")
+(defconst nvemacs--homepage-name "*nvEmacs home*")
 (defvar-local nvemacs--previewed nil "Path last shown in the note pane.")
 (defvar-local nvemacs--preview-timer nil)
 (defvar-local nvemacs--owned nil
@@ -2984,10 +3906,12 @@ A forced one comes from `nvemacs-layout-cycle'.  The temporary pane of
 
 (defun nvemacs--setup-note-window (win buffer)
   "Make WIN the note pane and show BUFFER in it.
-With BUFFER nil, show the \"No note selected\" placeholder."
+With BUFFER nil, show the home page if it is up in WIN's frame, else
+the \"No note selected\" placeholder."
   (set-window-parameter win 'nvemacs-note t)
-  (set-window-buffer win (or buffer (nvemacs--placeholder)))
-  (unless buffer (nvemacs--draw-placeholder)))
+  (let ((shown (or buffer (nvemacs--homepage-up-buffer (window-frame win)))))
+    (set-window-buffer win (or shown (nvemacs--placeholder)))
+    (unless shown (nvemacs--draw-placeholder))))
 
 (defun nvemacs--apply-layout (&optional frame)
   "Lay out FRAME in its arrangement, keeping the note shown in the pane."
@@ -3017,6 +3941,7 @@ Without SELECT this is a preview (see `nvemacs--visit').  The note it
 replaces is closed if nvEmacs opened it and it is unmodified."
   (let ((nw (nvemacs--note-window)))
     (when (and nw path)
+      (nvemacs--set-fparam 'nvemacs-homepage-up nil)
       (let ((buf (nvemacs--visit path (not select))))
         (set-window-buffer nw buf)
         (with-current-buffer nvemacs--buffer-name (setq nvemacs--previewed path))
@@ -3026,19 +3951,22 @@ replaces is closed if nvEmacs opened it and it is unmodified."
 (defvar-local nvemacs--on-row nil "Non-nil if point was on a result row after the last command.")
 
 (defun nvemacs--clear-pane ()
-  "Show \"No note selected\" in the note pane (nothing is selected)."
+  "Show \"No note selected\" in the note pane (nothing is selected).
+The home page stays while it is up: only selecting or opening a note
+ends it."
   (let ((nw (nvemacs--note-window)))
-    (when (and nw (not (equal (buffer-name (window-buffer nw)) nvemacs--placeholder-name)))
+    (when (and nw (not (nvemacs--fparam 'nvemacs-homepage-up))
+               (not (equal (buffer-name (window-buffer nw)) nvemacs--placeholder-name)))
       (nvemacs--setup-note-window nw nil)
       (with-current-buffer nvemacs--buffer-name (setq nvemacs--previewed nil))
       (nvemacs--sweep))))
 
 (defun nvemacs--preview-now ()
-  "Show the note of the row at point in the note pane.
-The pane follows the SELECTED ROW: with point on the search line,
-nothing is previewed (no note is selected at start)."
+  "Show the selected note in the note pane.
+The pane follows the SELECTED ROW: with none, nothing is previewed (no
+note is selected at start), and scrolling the list changes nothing."
   (let ((nw (nvemacs--note-window)))
-    (when (and nw (not (nvemacs--in-query-p)))
+    (when (and nw (nvemacs--selection))
       (let ((path (nvemacs--target-path)))
         ;; Compare with what the pane shows now, not with the last path
         ;; previewed: the sweep may have closed it.
@@ -3062,21 +3990,32 @@ nothing is previewed (no note is selected at start)."
 Moving from a row onto the search line deselects and blanks the pane,
 except when returning from a note with `nvemacs-searchbar-return': that
 note stays shown."
-  (let ((on-row (not (nvemacs--in-query-p))))
+  ;; With no rows, the empty line under the search line is not a place to be.
+  (when (and nvemacs--query-start (null nvemacs--shown) (not (nvemacs--in-query-p)))
+    (goto-char nvemacs--query-start)
+    (end-of-line))
+  ;; The end of the last row is at the window's right edge, where Emacs would
+  ;; scroll the list sideways.  M-> and C-n past the end land there.
+  (when (and nvemacs--shown (eobp)) (goto-char (line-beginning-position)))
+  (nvemacs--selection-update)
+  (let ((on-row (not (nvemacs--on-search-line-p))))
+    ;; On a real row: a click on the prompt selects nothing.
+    (when (and on-row (nvemacs--selection)) (nvemacs--set-fparam 'nvemacs-homepage-up nil))
     (when (and nvemacs--on-row (not on-row) (not (eq this-command 'nvemacs-searchbar-return)))
       (nvemacs--clear-pane))
     (setq nvemacs--on-row on-row))
+  (nvemacs--grow-near-bottom)
   (when nvemacs-show-selected-title (nvemacs--show-selected-title))
   (nvemacs--schedule-preview))
 
 (define-minor-mode nvemacs-note-mode
   "Buffer-local mode in the notes nvEmacs shows.
-\\<nvemacs-note-mode-map>\\[nvemacs-searchbar-return] returns to the list.
+\\<nvemacs-note-mode-map>\\[nvemacs-searchbar-return] returns to the list, \\[nvemacs-quit] exits nvEmacs.
 nvEmacs turns the mode off in every buffer when it exits."
   :lighter " nv"
   :keymap (let ((map (make-sparse-keymap)))
             (define-key map (kbd "C-c )") #'nvemacs-searchbar-return)
-            (define-key map [remap save-buffer] #'nvemacs-note-save)
+            (define-key map (kbd "C-c C-]") #'nvemacs-quit) ; Org leaves it free
             map)
   (if nvemacs-note-mode
       (add-hook 'kill-buffer-hook #'nvemacs--note-killed nil t)
@@ -3090,18 +4029,21 @@ nothing matches, create a note named after the search."
   (interactive)
   (let ((path (nvemacs--target-path)))
     (cond
-     ((and (nvemacs--in-query-p) (not nvemacs--selected-title)
+     ((and (nvemacs--on-search-line-p) (not nvemacs--selected-title)
            (string-empty-p (string-trim (nvemacs--query))))
       (nvemacs-note-new ""))
      ((and (null path) (null nvemacs--shown))
       (nvemacs-note-new (string-trim (nvemacs--search-text))))
-     ((null path) (message "nvEmacs: no note on this line"))
+     ((null path)
+      (message "%s" (nvemacs--command-text 'nvemacs-note-open "requires a note's row"
+                                           "Move to a row and then re-run the command")))
      (t (nvemacs--open-path path)))))
 
 (defun nvemacs--open-path (path)
   "Show PATH in the note pane with the cursor in it, or take the frame."
   (if (nvemacs--note-window)
       (nvemacs--show-in-pane path t)
+    (nvemacs--set-fparam 'nvemacs-homepage-up nil)
     (let ((buf (nvemacs--visit path)))
       (nvemacs--set-fparam 'nvemacs-l1 (cons (current-window-configuration) buf))
       (delete-other-windows)
@@ -3118,7 +4060,10 @@ again on `nvemacs-searchbar-return' or when the note is killed.  With
   (let ((path (nvemacs--target-path)))
     (cond
      ((eq nvemacs-other-window-action 'open) (nvemacs-note-open))
-     ((not path) (message "nvEmacs: no match"))
+     ((not path)
+      (message "%s" (nvemacs--command-text 'nvemacs-note-open-other-window
+                                           "requires a note to open, and none is listed"
+                                           "Change the search and then re-run the command")))
      (t
       (unless (nvemacs--note-window)
         (nvemacs--set-fparam 'nvemacs-temp t)
@@ -3142,6 +4087,8 @@ again on `nvemacs-searchbar-return' or when the note is killed.  With
     (when lw
       (select-window lw)
       (with-current-buffer nvemacs--buffer-name
+        (setq nvemacs--selected-id nil)
+        (nvemacs--view-free-set nil)
         (goto-char nvemacs--query-start) (end-of-line)))))
 
 (defun nvemacs-searchbar-return ()
@@ -3222,7 +4169,8 @@ That is the layout before `nvemacs' took the frame.  Return non-nil if
 there was a layout to restore."
   (let* ((frame (or frame (selected-frame)))
          (l0 (nvemacs--fparam 'nvemacs-l0 frame)))
-    (dolist (p '(nvemacs-active nvemacs-l0 nvemacs-override nvemacs-temp nvemacs-current nvemacs-l1))
+    (dolist (p '(nvemacs-active nvemacs-l0 nvemacs-override nvemacs-temp nvemacs-current nvemacs-l1
+                 nvemacs-homepage-up))
       (nvemacs--set-fparam p nil frame))
     (when l0 (set-window-configuration l0) t)))
 
@@ -3263,10 +4211,12 @@ and close the placeholder and the unmodified notes nvEmacs opened
   (nvemacs--widths-save)
   (nvemacs--session-end)
   ;; Helper lists show nvEmacs state; stale once it is gone. The report stays: it may be kept to compare.
-  (dolist (b '("*nvEmacs tags*" "*nvEmacs skipped*"))
+  (dolist (f (frame-list)) (set-frame-parameter f 'nvemacs-homepage-up nil))
+  (dolist (b (list "*nvEmacs tags*" "*nvEmacs skipped*" nvemacs--homepage-name))
     (when (get-buffer b) (kill-buffer b)))
   (nvemacs--kept-drop)
   (when nvemacs-auto-save-interval (nvemacs--commit-all))
+  (nvemacs--homepage-save)              ; after the last notes are written
   (nvemacs--sync-disable)
   (nvemacs--release-notes)
   (let ((frames (cl-remove-if-not (lambda (f) (frame-parameter f 'nvemacs-active)) (frame-list))))
@@ -3448,7 +4398,10 @@ goes to the Trash."
          (existing (nvemacs--existing-file dir name))
          (path (or existing (expand-file-name name dir))))
     (unless (nvemacs--watched-note-p path)
-      (user-error "nvEmacs: %s is not inside a watched directory with an imported extension" path))
+      (nvemacs--command-error
+       'nvemacs-note-new
+       (format "requires a note type in a watched folder, and %s is not" path)
+       "Check nvemacs-new-note-directory and the naming style, and then re-run the command"))
     (let ((missing nil))
       (unless existing
         ;; No :template: a blank note. A template file that cannot be read:
@@ -3475,8 +4428,11 @@ goes to the Trash."
               (goto-char (point-max))))))
       (nvemacs--open-path path)
       (when missing
-        (message "nvEmacs: template %s not found; the note starts blank (M-x customize-variable RET nvemacs-template-directory)"
-                 missing)))))
+        (message "%s" (nvemacs--command-text
+                       'nvemacs-note-new
+                       (format "requires the template %s, which was not found, so the note starts blank"
+                               missing)
+                       "Set nvemacs-template-directory to the folder that holds it"))))))
 
 ;;;; Pending edits: a temp file until a save or leaving the note
 ;;
@@ -3506,13 +4462,16 @@ A write that brings the text back to TEXT also brings the date back.")
   "Non-nil after a tag edit from the list: written when the cursor leaves the row.")
 (defvar-local nvemacs--sister-held nil
   "(TAGS) waiting to go to this note's sister file, or nil.")
+(defvar-local nvemacs--save-skipped nil
+  "Non-nil during a save that found nothing to write to the file.")
 (dolist (v '(nvemacs--attached nvemacs--edited nvemacs--base nvemacs--pending-file
              nvemacs--pending-tick nvemacs--held nvemacs--held-told nvemacs--tags-stay
-             nvemacs--sister-held))
+             nvemacs--sister-held nvemacs--save-skipped))
   (put v 'permanent-local t))           ; they survive a major-mode change
 
 (defconst nvemacs--note-hooks
   '((first-change-hook . nvemacs--first-change)
+    (write-contents-functions . nvemacs--save-unchanged)
     (after-save-hook . nvemacs--after-save)
     (kill-buffer-query-functions . nvemacs--kill-query)
     (kill-buffer-hook . nvemacs--note-closing)
@@ -3680,12 +4639,39 @@ note end here: the buffer is marked unmodified and the temp file goes."
           (setq nvemacs--held nil)      ; look again at the next check
           (unless (and nvemacs--pending-file
                        (eql nvemacs--pending-tick (buffer-chars-modified-tick)))
-            (if (and (buffer-modified-p) (verify-visited-file-modtime b)
-                     (or (and (nvemacs--untouched-p) (not (file-exists-p buffer-file-name)))
-                         (nvemacs--same-as-file-p)))
-                (progn (set-buffer-modified-p nil)
-                       (if nvemacs--sister-held (nvemacs--pending-write) (nvemacs--pending-delete)))
+            (unless (nvemacs--settle)
               (nvemacs--pending-write))))))))
+
+(defun nvemacs--settle ()
+  "If this note has nothing to write, mark it unmodified; return non-nil if so."
+  (when (and (buffer-modified-p) (verify-visited-file-modtime)
+             (or (and (nvemacs--untouched-p) (not (file-exists-p buffer-file-name)))
+                 (nvemacs--same-as-file-p)))
+    (set-buffer-modified-p nil)
+    (if nvemacs--sister-held (nvemacs--pending-write) (nvemacs--pending-delete))
+    t))
+
+(defun nvemacs--settle-unchanged (&rest _)
+  "Before Emacs asks which buffers to save, clear notes with nothing to write.
+Typing deleted by hand keeps the modified flag until the next idle check,
+and Emacs would ask about a note that has not changed.  This is `:before'
+advice on `save-some-buffers' and `save-buffers-kill-emacs' while nvEmacs
+runs."
+  (dolist (b (copy-sequence nvemacs--waiting))
+    (when (buffer-live-p b)
+      (with-current-buffer b
+        (with-demoted-errors "nvEmacs: checking a note: %S"
+          (when buffer-file-name (nvemacs--settle)))))))
+
+(defun nvemacs--save-unchanged ()
+  "Skip a save that would not change the file, keeping its date.
+Run from `write-contents-functions'.  A new note has no file yet, so
+saving it still creates it."
+  (when (and (not nvemacs--committing) (buffer-modified-p) (nvemacs--same-as-file-p))
+    (set-buffer-modified-p nil)
+    (setq nvemacs--save-skipped t)
+    (message "(No changes need to be saved)")
+    t))
 
 (defun nvemacs--hold (reason)
   "Keep this note's edits unwritten because of REASON, and say so once."
@@ -3755,6 +4741,13 @@ During a minibuffer prompt, that is the buffer the prompt came from."
   "Write the notes the cursor has left; run after every command.
 A signal here would make Emacs drop this function from
 `post-command-hook', so errors are only shown."
+  ;; Runs after the list's own hook.  A command reading the minibuffer has
+  ;; not finished yet.
+  (when (zerop (minibuffer-depth)) (setq nvemacs--command-here nil))
+  ;; A new note saved by hand is kept, even with nothing to write: Emacs
+  ;; runs no save hook then, so the command itself is the only sign.
+  (when (and nvemacs--new-note-start (eq this-command 'save-buffer))
+    (setq nvemacs--new-note-start nil))
   (when (and nvemacs--waiting nvemacs-auto-save-interval)
     (with-demoted-errors "nvEmacs: writing a note: %S"
       (let ((here (nvemacs--cursor-buffer)))
@@ -3778,26 +4771,21 @@ A signal here would make Emacs drop this function from
 This is a buffer-local `after-save-hook' of the notes nvEmacs opened
 itself (see `nvemacs--visit'); saving any other buffer runs nothing of
 nvEmacs.  A note saved elsewhere reaches the index at the next rescan,
-as a change made outside Emacs does.  A save by hand is final: the
-note's old date does not come back, and a new note is kept."
-  (if nvemacs--committing
-      (nvemacs--restore-date)
-    (setq nvemacs--base nil nvemacs--new-note-start nil))
-  (when nvemacs--sister-held (nvemacs--sister-flush))
-  (nvemacs--pending-delete)
-  (setq nvemacs--held nil nvemacs--held-told nil nvemacs--tags-stay nil
-        nvemacs--waiting (delq (current-buffer) nvemacs--waiting))
-  (when (and nvemacs--db (nvemacs--watched-note-p buffer-file-name))
-    (nvemacs--reindex buffer-file-name)))
-
-(defun nvemacs-note-save ()
-  "Save this note, even if its edits were undone.
-A save by hand is final.  Plain `save-buffer' writes nothing once undo
-has brought the buffer back to its saved text."
-  (interactive)
-  (when (and nvemacs--attached nvemacs--base (not (buffer-modified-p)))
-    (set-buffer-modified-p t))
-  (call-interactively #'save-buffer))
+as a change made outside Emacs does.  A save by hand that wrote is
+final: the note's old date does not come back, and a new note is kept.
+One that found nothing to write (`nvemacs--save-unchanged') changes
+neither."
+  (let ((skipped nvemacs--save-skipped))
+    (setq nvemacs--save-skipped nil)
+    (cond (skipped nil)
+          (nvemacs--committing (nvemacs--restore-date))
+          (t (setq nvemacs--base nil nvemacs--new-note-start nil)))
+    (when nvemacs--sister-held (nvemacs--sister-flush))
+    (nvemacs--pending-delete)
+    (setq nvemacs--held nil nvemacs--held-told nil nvemacs--tags-stay nil
+          nvemacs--waiting (delq (current-buffer) nvemacs--waiting))
+    (when (and (not skipped) nvemacs--db (nvemacs--watched-note-p buffer-file-name))
+      (nvemacs--reindex buffer-file-name))))
 
 (defun nvemacs--kill-query ()
   "Spare a note that has not really changed Emacs's kill question.
@@ -3925,26 +4913,32 @@ so it does not cover the notelist."
         (progn (set-window-buffer pane buf) (select-window pane))
       (pop-to-buffer buf))))
 
-(defun nvemacs--recover-at-point ()
-  "Return the temp-file record on this line."
+(defun nvemacs--recover-at-point (command)
+  "Return the temp-file record on this line, for COMMAND."
   (or (get-text-property (line-beginning-position) 'nvemacs-edits-recover)
-      (user-error "nvEmacs: No note on this line")))
+      (nvemacs--command-error command "requires a line that lists a note"
+                              "Move to one and then re-run the command")))
 
 (defun nvemacs-edits-use ()
   "Put the edits on this line back into their note, for you to review.
 The note's file is written as usual: when the cursor leaves the note."
   (interactive)
-  (let* ((rec (nvemacs--recover-at-point)) (path (plist-get rec :path)))
+  (let* ((rec (nvemacs--recover-at-point 'nvemacs-edits-use)) (path (plist-get rec :path)))
     (unless (get-buffer nvemacs--buffer-name)
-      (user-error "nvEmacs: Start nvEmacs first (M-x nvemacs)"))
+      (nvemacs--command-error 'nvemacs-edits-use "requires that nvEmacs is running"
+                              "Run M-x nvemacs and then re-run the command"))
     ;; The file names where it would write: never outside the notes.
     (unless (nvemacs--watched-note-p path)
-      (user-error "nvEmacs: %s is not a note in a watched directory" path))
+      (nvemacs--command-error
+       'nvemacs-edits-use (format "requires a note in a watched folder, and %s is not" path)
+       "Add its folder to nvemacs-watched-directories and then re-run the command"))
     (let ((buf (nvemacs--visit path)))
       (with-current-buffer buf
         (when (buffer-modified-p)
-          (user-error "nvEmacs: %s has unsaved edits open: save or revert them first"
-                      (file-name-nondirectory path)))
+          (nvemacs--command-error
+           'nvemacs-edits-use
+           (format "requires that %s has no unsaved edits" (file-name-nondirectory path))
+           "Save or revert them and then re-run the command"))
         (when (plist-get rec :edited)
           (let ((inhibit-read-only t))
             (save-restriction (widen) (erase-buffer) (insert (plist-get rec :text)))))
@@ -3963,7 +4957,7 @@ The note's file is written as usual: when the cursor leaves the note."
   "Show how the edits on this line differ from their note."
   (interactive)
   (require 'diff)
-  (let* ((rec (nvemacs--recover-at-point))
+  (let* ((rec (nvemacs--recover-at-point 'nvemacs-edits-diff))
          (path (plist-get rec :path))
          (old (if (file-exists-p path) path (generate-new-buffer " *nvEmacs recover: none*")))
          (new (generate-new-buffer " *nvEmacs recover: edits*"))
@@ -3979,7 +4973,7 @@ The note's file is written as usual: when the cursor leaves the note."
 (defun nvemacs-edits-discard ()
   "Discard the edits on this line: they move to discarded/ for 7 days."
   (interactive)
-  (let ((rec (nvemacs--recover-at-point)))
+  (let ((rec (nvemacs--recover-at-point 'nvemacs-edits-discard)))
     (nvemacs--discard-file (plist-get rec :file) (plist-get rec :path))
     (nvemacs-edits-recover)
     (message "nvEmacs: Discarded (kept for %d days in %s)"
@@ -4146,8 +5140,11 @@ to save; a sister file is not in that buffer, so it is written now."
           (let ((setter (if (equal (downcase (file-name-extension path)) "org")
                             #'nvemacs--org-set-filetags #'nvemacs--md-set-tags)))
             (unless (verify-visited-file-modtime buf)
-              (user-error "nvEmacs: %s changed on disk; revert it first"
-                          (file-name-nondirectory path)))
+              (nvemacs--command-error
+               'nvemacs-tags-edit
+               (format "requires that %s match its file, and the file changed on disk"
+                       (file-name-nondirectory path))
+               "Run M-x revert-buffer in the note and then re-run the command"))
             (unless (equal tags (mapcar #'car (cl-remove-if-not
                                                (lambda (tk) (eq (cdr tk) 'file))
                                                (nvemacs--tags-now path))))
@@ -4164,11 +5161,11 @@ to save; a sister file is not in that buffer, so it is written now."
 
 (defun nvemacs--tags-target ()
   "Return the note a tag command acts on.
-That is the note of the row at point in *nvEmacs*, or the note visited
-in the current buffer."
+That is the selected note in *nvEmacs*, or the note visited in the
+current buffer."
   (cond
    ((derived-mode-p 'nvemacs-mode)
-    (let ((id (and (not (nvemacs--in-query-p)) (nvemacs--row-id))))
+    (let ((id (nvemacs--selection)))
       (and id (caar (sqlite-select (nvemacs--db) "SELECT path FROM meta WHERE id = ?" (list id))))))
    ((and buffer-file-name (nvemacs--watched-note-p buffer-file-name))
     (nvemacs--canonical-path buffer-file-name))))
@@ -4185,8 +5182,7 @@ completion offers every tag.  Spaces and punctuation become `_'.  This
 is an edit of the note: it is written, and reaches the index, when the
 cursor leaves the note or its row."
   (interactive)
-  (let* ((path (or path (nvemacs--tags-target)
-                   (user-error "nvEmacs: Select a note first (move to its row)")))
+  (let* ((path (or path (nvemacs--selected-note 'nvemacs-tags-edit)))
          (current (mapcar #'car (cl-remove-if-not (lambda (tk) (eq (cdr tk) 'file))
                                                   (nvemacs--tags-now path))))
          (answer (completing-read-multiple
@@ -4263,6 +5259,13 @@ Each row is (LABEL . VALUE), as `nvemacs--report-render' shows them."
       ("Not shown" . ("SQLite's own memory use cannot be read from Elisp: the cache LIMIT is shown."
                       "Index pages also sit in the macOS file cache, which belongs to the system.")))))
 
+(defun nvemacs--orphan-tag-files ()
+  "Return the `.tags' sister files, in the listed folders, with no note."
+  (cl-loop for d in nvemacs--listed-dirs
+           when (file-directory-p d)    ; it may be gone since the last walk
+           nconc (cl-remove-if (lambda (f) (file-exists-p (substring f 0 -5)))
+                               (directory-files d t "\\.tags\\'"))))
+
 (defun nvemacs--report-index ()
   "Return the rows of the Index report.
 Each row is (LABEL . VALUE), as `nvemacs--report-render' shows them."
@@ -4282,10 +5285,7 @@ Each row is (LABEL . VALUE), as `nvemacs--report-render' shows them."
       ("Note extensions" . ,(mapconcat #'identity nvemacs-import-extensions " "))
       ("Not indexed (M-x nvemacs-index-skipped)" . ,(length nvemacs--skipped))
       ("Tag files without a note"
-       . ,(or (cl-loop for d in nvemacs--listed-dirs
-                       nconc (cl-remove-if (lambda (f) (file-exists-p (substring f 0 -5)))
-                                           (directory-files d t "\\.tags\\'")))
-              '("none")))
+       . ,(or (nvemacs--orphan-tag-files) '("none")))
       ("Table sizes (bytes)"
        . ,(if tables
               (mapcar (lambda (r) (format "%-28s %s" (car r) (nvemacs--group-digits (cadr r)))) tables)
@@ -4416,6 +5416,770 @@ the rows listed and the note buffers opened."
   (nvemacs--report-render '("Instrumentation log")))
 
 ;;;###autoload
+;;;; Renaming, moving and deleting notes
+;;
+;; A note is more than its file: its sister tags file, open buffer, waiting
+;; edits, created date and index entry go with it.  None of these commands
+;; changes a note's text or its date.
+
+(defun nvemacs--selected-note (command)
+  "Return the path of the selected note, or signal an error from COMMAND."
+  (or (nvemacs--tags-target)
+      (nvemacs--command-error command "requires that a note be selected"
+                              "Move to its row and then re-run the command")))
+
+(defun nvemacs--note-target (command)
+  "Return the path of the note COMMAND acts on, which must be on disk."
+  (let ((path (nvemacs--selected-note command)))
+    (unless (file-exists-p path)
+      (nvemacs--command-error
+       command
+       (format "requires a note on disk, and %s has not been written yet"
+               (file-name-nondirectory path))
+       "Save it and then re-run the command"))
+    path))
+
+(defun nvemacs--check-destination (command old new)
+  "Signal an error from COMMAND unless OLD can become NEW safely.
+Nothing may be overwritten.
+Names are compared without case: APFS treats them as the same file, so
+a change of case alone is allowed.  A `.tags' file already at NEW would
+silently become the note's tags."
+  (let ((dir (file-name-directory new))
+        (name (file-name-nondirectory new))
+        (buf (find-buffer-visiting new)))
+    (let ((clash (nvemacs--existing-file dir name)))
+      (when (and clash (not (file-equal-p clash old)))
+        (nvemacs--command-error
+         command
+         (format "requires a name not in use, and %s already exists"
+                 (file-name-nondirectory clash))
+         "Rename one of the two notes and then re-run the command")))
+    (let ((clash (nvemacs--existing-file dir (concat name ".tags"))))
+      (when (and clash (not (file-equal-p clash (nvemacs--sister old))))
+        (nvemacs--command-error
+         command
+         (format "requires that no tags file has that name, and %s does"
+                 (file-name-nondirectory clash))
+         "Move or delete that tags file and then re-run the command")))
+    (when (and buf (not (eq buf (find-buffer-visiting old))))
+      (nvemacs--command-error
+       command
+       (format "requires that no other buffer visits %s, and %s does" name (buffer-name buf))
+       "Close that buffer and then re-run the command"))))
+
+(defun nvemacs--note-settle-edits (command path)
+  "Write the edits waiting for note PATH, or signal an error from COMMAND.
+A buffer the user had open before nvEmacs is theirs to save."
+  (let ((b (find-buffer-visiting path)))
+    (when b
+      (when (buffer-local-value 'nvemacs--attached b) (nvemacs--commit b))
+      (when (or (buffer-modified-p b) (buffer-local-value 'nvemacs--sister-held b))
+        (nvemacs--command-error
+         command
+         (format "requires that the edits to %s be written first, and they are not"
+                 (file-name-nondirectory path))
+         "Save or revert the note and then re-run the command")))))
+
+(defun nvemacs--note-files-move (old new)
+  "Move note OLD and its sister file to NEW: both, or neither."
+  (let ((sister (nvemacs--sister old)))
+    (rename-file old new)
+    (when (file-exists-p sister)
+      (condition-case err
+          (rename-file sister (nvemacs--sister new))
+        (error (rename-file new old)
+               (signal (car err) (cdr err)))))))
+
+(defun nvemacs--note-relocate (command old new)
+  "For COMMAND, move note OLD to NEW inside the watched folders.
+Its edits are written first.  Its sister file, buffer, created date and
+index entry follow.  The date is kept, so its row keeps its place."
+  (nvemacs--note-settle-edits command old)
+  (let ((buf (find-buffer-visiting old))
+        (created (gethash (nvemacs--dates-key old) (nvemacs--dates-table))))
+    (nvemacs--note-files-move old new)
+    (when buf
+      (with-current-buffer buf
+        (set-visited-file-name new t t)
+        (set-visited-file-modtime)
+        ;; Visiting a new name turns Emacs's auto-save back on, and a new
+        ;; extension can change the major mode, which ends minor modes.
+        (when nvemacs--attached (nvemacs--emacs-auto-save-off))
+        (unless nvemacs-note-mode (nvemacs-note-mode 1))))
+    (when created (nvemacs--dates-seen new created))
+    (nvemacs--reindex new old)))
+
+(defun nvemacs--note-let-go (buf &optional new)
+  "Note buffer BUF's file has left nvEmacs, for path NEW or the Trash.
+Note panes stop showing it.  A buffer nvEmacs opened is closed; one the
+user had open stays, visiting NEW if there is one."
+  (when buf
+    (dolist (w (get-buffer-window-list buf nil t))
+      (when (window-parameter w 'nvemacs-note) (nvemacs--setup-note-window w nil)))
+    (when (get-buffer nvemacs--buffer-name)
+      (with-current-buffer nvemacs--buffer-name (setq nvemacs--previewed nil)))
+    (if (buffer-local-value 'nvemacs--owned buf)
+        (kill-buffer buf)
+      (with-current-buffer buf
+        (when new
+          (set-visited-file-name new t t)
+          (set-visited-file-modtime))
+        (nvemacs-note-mode -1)))
+    (when (window-parameter (selected-window) 'nvemacs-note) (nvemacs--focus-query))))
+
+(defun nvemacs--rename-path (old name)
+  "Return the path note OLD gets when renamed to NAME, or signal.
+A NAME with no extension keeps the note's.  Any other extension must be
+one of `nvemacs-import-extensions', or the note would drop out of search."
+  (let ((name (string-trim name)))
+    (when (or (string-empty-p name) (string-prefix-p "." name) (string-search "/" name))
+      (nvemacs--command-error
+       'nvemacs-note-rename
+       "requires a name that is not empty, does not start with a dot and has no /"
+       "Re-run the command with another name"))
+    (unless (file-name-extension name)
+      (setq name (concat name "." (file-name-extension old))))
+    (unless (member (downcase (file-name-extension name)) nvemacs-import-extensions)
+      (nvemacs--command-error
+       'nvemacs-note-rename
+       (format "requires a supported extension, and .%s is not one" (file-name-extension name))
+       (format "Re-run the command with a name ending in %s"
+               (mapconcat (lambda (e) (concat "." e)) nvemacs-import-extensions ", "))))
+    (expand-file-name name (file-name-directory old))))
+
+(defun nvemacs--tags-lost (old new)
+  "Return the tags of note OLD that nvEmacs stops reading if it becomes NEW.
+Org, Markdown and plain text keep tags in different places."
+  (let ((place (lambda (p) (if (nvemacs--tags-in-file-p p)
+                               (downcase (file-name-extension p))
+                             'sister))))
+    (unless (equal (funcall place old) (funcall place new))
+      (delete-dups (mapcar #'car (nvemacs--tags-now old))))))
+
+(defun nvemacs--extension-change-ok-p (old new)
+  "Non-nil if OLD and NEW share an extension, or the user accepts the change."
+  (let ((from (file-name-extension old)) (to (file-name-extension new)))
+    (or (string-equal-ignore-case from to)
+        (let ((lost (nvemacs--tags-lost old new)))
+          (y-or-n-p (format "Change the extension from .%s to .%s%s? " from to
+                            (if lost
+                                (format " (tags no longer read: %s)" (string-join lost ", "))
+                              "")))))))
+
+(defun nvemacs-note-rename (name)
+  "Rename the selected note's file to NAME, in the same folder.
+Only the filename changes: the text, including any title in it, and the
+date stay.  A NAME with no extension keeps the note's.  A new extension
+must be a supported one, and is confirmed first.  The note's tags file
+and open buffer follow it, and edits waiting for it are written first."
+  (interactive
+   (let ((file (file-name-nondirectory (nvemacs--note-target 'nvemacs-note-rename))))
+     (list (read-string (format "Rename %s to: " file) file))))
+  (let* ((old (nvemacs--note-target 'nvemacs-note-rename))
+         (new (nvemacs--rename-path old name)))
+    (if (string= old new)
+        (message "nvEmacs: the name is unchanged")
+      (nvemacs--check-destination 'nvemacs-note-rename old new)
+      (if (nvemacs--extension-change-ok-p old new)
+          (progn (nvemacs--note-relocate 'nvemacs-note-rename old new)
+                 (message "nvEmacs: renamed to %s" (file-name-nondirectory new)))
+        (message "nvEmacs: not renamed")))))
+
+(defun nvemacs--move-folders (path)
+  "Return the watched folders note PATH could move to, for reading."
+  (sort (cl-loop for d in nvemacs--listed-dirs
+                 unless (or (equal d (file-name-directory path)) (not (file-directory-p d)))
+                 collect (abbreviate-file-name d))
+        #'string<))
+
+(defun nvemacs--folder-path (dir)
+  "Return DIR resolved through symlinks, as a directory name."
+  (file-name-as-directory (file-truename (expand-file-name dir))))
+
+(defun nvemacs-note-move (dir)
+  "Move the selected note to DIR, another watched folder.
+Its text and date stay, and its tags file and open buffer follow it."
+  (interactive
+   (let* ((path (nvemacs--note-target 'nvemacs-note-move))
+          (folders (or (nvemacs--move-folders path)
+                       (nvemacs--command-error
+                        'nvemacs-note-move "requires another watched folder, and there is none"
+                        "Add one to nvemacs-watched-directories and then re-run the command"))))
+     (list (completing-read (format "Move %s to folder: " (file-name-nondirectory path))
+                            folders nil t))))
+  (let* ((old (nvemacs--note-target 'nvemacs-note-move))
+         (dest (nvemacs--folder-path dir))
+         (new (expand-file-name (file-name-nondirectory old) dest)))
+    (unless (member dest nvemacs--listed-dirs)
+      (nvemacs--command-error
+       'nvemacs-note-move (format "requires a watched folder, and %s is not one" dir)
+       "Use M-x nvemacs-note-move-outside to move the note there"))
+    (when (equal dest (file-name-directory old))
+      (nvemacs--command-error
+       'nvemacs-note-move (format "requires a different folder, and the note is already in %s" dir)
+       "Re-run the command and choose another folder"))
+    (nvemacs--check-destination 'nvemacs-note-move old new)
+    (nvemacs--note-relocate 'nvemacs-note-move old new)
+    (message "nvEmacs: moved %s to %s" (file-name-nondirectory new) (abbreviate-file-name dest))))
+
+(defun nvemacs-note-move-outside (dir)
+  "Move the selected note to DIR, a folder nvEmacs does not watch.
+The note leaves the index, so this asks first.  Edits waiting for it
+are written, its tags file goes with it, and a buffer nvEmacs opened
+for it is closed."
+  (interactive
+   (list (read-directory-name
+          (format "Move %s out of nvEmacs, to folder: "
+                  (file-name-nondirectory (nvemacs--note-target 'nvemacs-note-move-outside)))
+          nil nil t)))
+  (let* ((old (nvemacs--note-target 'nvemacs-note-move-outside))
+         (name (file-name-nondirectory old))
+         (dest (nvemacs--folder-path dir))
+         (new (expand-file-name name dest)))
+    (when (member dest nvemacs--listed-dirs)
+      (nvemacs--command-error
+       'nvemacs-note-move-outside
+       (format "requires a folder nvEmacs does not watch, and %s is watched" dir)
+       "Use M-x nvemacs-note-move to move the note there"))
+    (unless (file-directory-p dest)
+      (nvemacs--command-error
+       'nvemacs-note-move-outside (format "requires an existing folder, and %s does not exist" dir)
+       "Create it and then re-run the command"))
+    (nvemacs--check-destination 'nvemacs-note-move-outside old new)
+    (if (not (y-or-n-p (format "Stop finding %s in nvEmacs and move it to %s? "
+                               name (abbreviate-file-name dest))))
+        (message "nvEmacs: not moved")
+      (nvemacs--note-settle-edits 'nvemacs-note-move-outside old)
+      (let ((buf (find-buffer-visiting old)))
+        (nvemacs--note-files-move old new)
+        (nvemacs--forget old)
+        (nvemacs--note-let-go buf new))
+      (message "nvEmacs: moved %s to %s" name (abbreviate-file-name dest)))))
+
+(defun nvemacs-note-delete ()
+  "Move the selected note and its tags file to the system Trash.
+This asks first.  Unsaved edits are kept in discarded/ for 7 days, and
+the note goes to the Trash as it is on disk.  A note with unsaved edits
+in a buffer you had open before nvEmacs must be saved or reverted first."
+  (interactive)
+  (let* ((path (nvemacs--note-target 'nvemacs-note-delete))
+         (name (file-name-nondirectory path))
+         (buf (find-buffer-visiting path))
+         (owned (and buf (buffer-local-value 'nvemacs--owned buf)))
+         (edits (and buf (with-current-buffer buf
+                           (or nvemacs--sister-held
+                               (and (buffer-modified-p) (not (nvemacs--same-as-file-p))))))))
+    (when (and edits (not owned))
+      (nvemacs--command-error
+       'nvemacs-note-delete
+       (format "requires that %s has no unsaved edits in a buffer you opened yourself" name)
+       "Save or revert it and then re-run the command"))
+    (if (not (y-or-n-p (format "%sMove %s to the Trash? "
+                               (if edits
+                                   (format "Its unsaved edits are kept in discarded/ for %d days.  "
+                                           nvemacs--discarded-days)
+                                 "")
+                               name)))
+        (message "nvEmacs: not deleted")
+      (let ((sister (nvemacs--sister path)))
+        (nvemacs--move-to-trash path)
+        (when (file-exists-p sister)
+          (with-demoted-errors "nvEmacs: moving the tags file to the Trash: %S"
+            (nvemacs--move-to-trash sister))))
+      (when owned
+        (with-current-buffer buf
+          (when edits (nvemacs--discard-edits))
+          ;; Closing a note writes waiting tags: they would bring back
+          ;; the tags file that just went to the Trash.
+          (setq nvemacs--sister-held nil)
+          (set-buffer-modified-p nil)))
+      (nvemacs--forget path)
+      (nvemacs--note-let-go buf)
+      (message "nvEmacs: moved %s to the Trash" name))))
+
+;;;; Home page
+;;
+;; A plain Org or Markdown file in the data directory, built from a template
+;; when nvEmacs exits and shown in the note pane at launch.  Org pages are
+;; rendered by Org, loaded only after the list is on screen (about 200 ms).
+;; Markdown pages use a small viewer: markdown-mode is not part of Emacs.
+;; What a crash could make stale (edits to recover) is worked out at launch
+;; and shown above the file, never stored in it.
+
+(defconst nvemacs-version (package-get-version) "The version of nvEmacs.")
+
+(defcustom nvemacs-homepage-file nil
+  "File of the live home page.
+nil means homepage.EXT in `nvemacs-data-directory', with the extension
+of `nvemacs-homepage-template'.  nvEmacs overwrites this file: to change
+the page, change the template.  Keep it out of the watched directories,
+or it is indexed as a note."
+  :type '(choice (const :tag "In the data directory" nil) file))
+
+(defcustom nvemacs-homepage-template "homepage.org"
+  "Template of the home page, a file in `nvemacs-template-directory'.
+nvEmacs ships homepage.org and homepage.md.  A name not found there is
+looked up among the shipped templates."
+  :type 'string)
+
+(defcustom nvemacs-homepage-show-at-start t
+  "Non-nil means show the home page when nvEmacs starts.
+\\[nvemacs-homepage-show] shows it at any time."
+  :type 'boolean)
+
+(defface nvemacs-homepage-heading '((t :inherit bold))
+  "Face of the headings on a Markdown home page.")
+
+(defface nvemacs-homepage-code '((t :inherit font-lock-constant-face))
+  "Face of `code' on a Markdown home page.")
+
+(defconst nvemacs--homepage-history-size 20 "Sessions of timings to keep.")
+(defconst nvemacs--homepage-recent-notes 8 "Recently edited notes to list.")
+
+(defvar nvemacs--homepage-run nil
+  "This session's timings and startup check, a plist, or nil.")
+
+(defvar-keymap nvemacs-homepage-mode-map
+  :doc "Keys of the home page."
+  "RET" #'nvemacs-homepage-open-link
+  "q" #'nvemacs-searchbar-return
+  "g" #'nvemacs-homepage-show)
+
+(defconst nvemacs--default-keymaps
+  `(("list" . ,(copy-keymap nvemacs-mode-map))
+    ("note" . ,(copy-keymap nvemacs-note-mode-map))
+    ("home page" . ,(copy-keymap nvemacs-homepage-mode-map)))
+  "Where nvEmacs's keys work and the keymaps as it ships them.
+They are copied before any user change.")
+
+(defun nvemacs--homepage-file ()
+  "Return the path of the live home page."
+  (or nvemacs-homepage-file
+      (expand-file-name (concat "homepage."
+                                (or (file-name-extension nvemacs-homepage-template) "org"))
+                        nvemacs-data-directory)))
+
+(defun nvemacs--homepage-md-p ()
+  "Non-nil if the home page template is Markdown."
+  (member (downcase (or (file-name-extension nvemacs-homepage-template) ""))
+          '("md" "markdown")))
+
+(defun nvemacs--homepage-template-file ()
+  "Return the home page template: the user's if any, else the shipped one."
+  (cl-find-if #'file-readable-p
+              (list (expand-file-name nvemacs-homepage-template nvemacs-template-directory)
+                    (expand-file-name nvemacs-homepage-template
+                                      (expand-file-name "templates/" nvemacs--directory)))))
+
+(defun nvemacs--homepage-history-file ()
+  "Return the file of the recent sessions' timings."
+  (expand-file-name "session-times.eld" nvemacs-data-directory))
+
+(defun nvemacs--homepage-history ()
+  "Return the recent sessions' timings, newest first; nil if unreadable."
+  (let ((f (nvemacs--homepage-history-file)))
+    (when (file-readable-p f)
+      (ignore-errors
+        (cl-remove-if-not (lambda (e) (numberp (plist-get e :ready-ms)))
+                          (with-temp-buffer
+                            (insert-file-contents f)
+                            (read (current-buffer))))))))
+
+(defun nvemacs--homepage-history-add (entry)
+  "Add ENTRY, a plist of timings, keeping the newest sessions."
+  (let* ((all (cons entry (nvemacs--homepage-history)))
+         (kept (cl-subseq all 0 (min (length all) nvemacs--homepage-history-size)))
+         (f (nvemacs--homepage-history-file)))
+    (nvemacs--private-directory (file-name-directory f))
+    (with-temp-buffer
+      (insert ";; nvEmacs timings of recent sessions (safe to delete).\n")
+      (prin1 kept (current-buffer))
+      (insert "\n")
+      (nvemacs--write-file f))))
+
+(defun nvemacs--homepage-ms (ms)
+  "Return the duration MS, in milliseconds, for reading."
+  (if (< ms 1000) (format "%d ms" (round ms)) (format "%.2f s" (/ ms 1000.0))))
+
+(defun nvemacs--homepage-times (key)
+  "Describe the timing KEY over the recent sessions."
+  (let ((vals (delq nil (mapcar (lambda (e) (plist-get e key)) (nvemacs--homepage-history)))))
+    (if (null vals)
+        "not measured yet"
+      (format "%s (min %s, average %s, max %s; last %d session%s)"
+              (nvemacs--homepage-ms (car vals))
+              (nvemacs--homepage-ms (apply #'min vals))
+              (nvemacs--homepage-ms (/ (apply #'+ vals) (float (length vals))))
+              (nvemacs--homepage-ms (apply #'max vals))
+              (length vals) (if (= 1 (length vals)) "" "s")))))
+
+(defun nvemacs--homepage-checked (run)
+  "The startup check RUN finished: the index is ready.
+Index ready is the index step plus this check, not the deliberately
+paced growth of the list."
+  (let ((h nvemacs--homepage-run))
+    (when h
+      (let ((ready (+ (plist-get h :index-ms) (plist-get run :wall-ms))))
+        (setq nvemacs--homepage-run
+              (append (list :checked t :new (plist-get run 'new)
+                            :changed (plist-get run 'changed)
+                            :deleted (plist-get run 'deleted))
+                      h))
+        (with-demoted-errors "nvEmacs: home page: %S"
+          (nvemacs--homepage-history-add
+           (list :when (format-time-string "%F %T")
+                 :list-ms (plist-get h :list-ms) :ready-ms ready))
+          (when (get-buffer-window nvemacs--homepage-name t)
+            (nvemacs--homepage-render)))))))
+
+(defun nvemacs--homepage-link (path title md)
+  "Return a link to note PATH labelled TITLE, in Markdown if MD.
+Brackets would break a link: a title gets parentheses instead, and a
+path with brackets is listed without a link."
+  (let ((label (string-replace "]" ")" (string-replace "[" "(" title))))
+    (cond ((string-match-p "[][<>\n]" path) label)
+          (md (format "[%s](<file:%s>)" label path))
+          (t (format "[[file:%s][%s]]" path label)))))
+
+(defun nvemacs--homepage-recent (md)
+  "Return the recently edited notes as a list, newest first, in Markdown if MD."
+  (mapconcat
+   (lambda (r)
+     (pcase-let ((`(,path ,title ,mtime) r))
+       (format "- %s (%s)"
+               (nvemacs--homepage-link
+                path (if (string-empty-p (or title "")) (file-name-base path) title) md)
+               (format-time-string "%F" mtime))))
+   (sqlite-select (nvemacs--db) "SELECT path, title, mtime FROM meta ORDER BY id DESC LIMIT ?"
+                  (list nvemacs--homepage-recent-notes))
+   "\n"))
+
+(defun nvemacs--homepage-table (header rows md)
+  "Return a table of HEADER and ROWS, lists of strings, in Markdown if MD."
+  (let* ((clean (lambda (r) (mapcar (lambda (c) (string-replace "|" "¦" c)) r)))
+         (all (mapcar clean (cons header rows)))
+         (widths (cl-loop for i below (length header)
+                          collect (apply #'max (mapcar (lambda (r) (string-width (nth i r))) all))))
+         (line (lambda (r)
+                 (concat "| "
+                         (mapconcat #'identity
+                                    (cl-mapcar (lambda (c w)
+                                                 (concat c (make-string (- w (string-width c)) ?\s)))
+                                               r widths)
+                                    " | ")
+                         " |")))
+         (rule (if md
+                   (concat "| " (mapconcat (lambda (w) (make-string w ?-)) widths " | ") " |")
+                 (concat "|" (mapconcat (lambda (w) (make-string (+ w 2) ?-)) widths "+") "|"))))
+    (mapconcat #'identity
+               (append (list (funcall line (car all)) rule) (mapcar line (cdr all)))
+               "\n")))
+
+(defun nvemacs--key-names (cmd maps)
+  "Return the keys of command CMD in keymaps MAPS, for reading.
+A remapped command shows the key the user presses."
+  (let ((names nil))
+    (dolist (k (where-is-internal cmd maps nil t t))
+      (cond
+       ((memq (aref k 0) '(menu-bar tool-bar)))
+       ((eq (aref k 0) 'remap)
+        (dolist (g (where-is-internal (aref k 1) (current-global-map)))
+          (unless (memq (aref g 0) '(menu-bar tool-bar))
+            (push (key-description g) names))))
+       ;; A click is also bound as its drag and double forms: one is enough.
+       ((string-match-p "\\`<\\(?:drag\\|double\\|triple\\)-mouse" (key-description k)))
+       (t (push (key-description k) names))))
+    (if names (mapconcat #'identity (delete-dups (nreverse names)) ", ") "-")))
+
+(defun nvemacs--homepage-key-rows (cmd)
+  "Return the key table's rows for command CMD, one per place its keys work.
+A command with no key gets one row: it is run by name, with \\[execute-extended-command]."
+  (let ((rows nil))
+    (pcase-dolist (`(,where . ,map)
+                   `(("list" . ,nvemacs-mode-map)
+                     ("note" . ,nvemacs-note-mode-map)
+                     ("home page" . ,nvemacs-homepage-mode-map)
+                     ("everywhere" . ,(current-global-map))))
+      (let* ((shipped (cdr (assoc where nvemacs--default-keymaps)))
+             (default (if shipped (nvemacs--key-names cmd (list shipped)) "-"))
+             (current (nvemacs--key-names cmd (list map))))
+        (unless (and (equal default "-") (equal current "-"))
+          (push (list (symbol-name cmd) where default current) rows))))
+    (or (nreverse rows) (list (list (symbol-name cmd) "M-x" "-" "-")))))
+
+(defun nvemacs--homepage-commands (md)
+  "Return a table of every command, where its keys work and which they are.
+The table is in Markdown if MD."
+  (let ((cmds nil))
+    (mapatoms (lambda (s)
+                (let ((n (symbol-name s)))
+                  (when (and (commandp s)
+                             (or (eq s 'nvemacs) (string-prefix-p "nvemacs-" n))
+                             (not (string-prefix-p "nvemacs--" n))
+                             (not (string-suffix-p "-mode" n)))
+                    (push s cmds)))))
+    (nvemacs--homepage-table
+     '("Command" "Where" "Default" "Current")
+     (mapcan #'nvemacs--homepage-key-rows (sort cmds #'string<))
+     md)))
+
+(defun nvemacs--homepage-values (md)
+  "Return the alist (PLACEHOLDER . TEXT) of the home page, in Markdown if MD."
+  (let* ((db (nvemacs--db))
+         (size (lambda (n) (file-size-human-readable (or n 0) (quote iec) " ")))
+         (index (nvemacs--index-path)))
+    `(("written" . ,(format-time-string "%F %R"))
+      ("version" . ,(or nvemacs-version "unknown"))
+      ("emacs-version" . ,emacs-version)
+      ("sqlite-version" . ,(caar (sqlite-select db "SELECT sqlite_version()")))
+      ("notes" . ,(nvemacs--group-digits (nvemacs--note-count)))
+      ("notes-size" . ,(funcall size (caar (sqlite-select db "SELECT sum(size) FROM meta"))))
+      ("notes-by-type"
+       . ,(mapconcat
+           (lambda (ext)
+             (let ((r (car (sqlite-select
+                            db "SELECT count(*), sum(size) FROM meta WHERE path LIKE ?"
+                            (list (concat "%." ext))))))
+               (format "- %s: %s (%s)" ext (nvemacs--group-digits (car r))
+                       (funcall size (cadr r)))))
+           nvemacs-import-extensions "\n"))
+      ("folders" . ,(mapconcat (lambda (d) (concat "- " d)) nvemacs-watched-directories "\n"))
+      ("index-file" . ,index)
+      ("index-size" . ,(funcall size (file-attribute-size (file-attributes index))))
+      ("last-rebuild"
+       . ,(or (caar (sqlite-select db "SELECT value FROM info WHERE key = 'rebuilt'"))
+              "not recorded"))
+      ("list-time" . ,(nvemacs--homepage-times :list-ms))
+      ("index-ready" . ,(nvemacs--homepage-times :ready-ms))
+      ("recent" . ,(nvemacs--homepage-recent md))
+      ("commands" . ,(nvemacs--homepage-commands md)))))
+
+(defun nvemacs--homepage-expand (template values)
+  "Fill the {placeholders} of TEMPLATE from the alist VALUES.
+The values go in as written, and an unknown placeholder is left alone."
+  (replace-regexp-in-string
+   "{\\([a-z-]+\\)}"
+   (lambda (m) (let ((v (assoc (substring m 1 -1) values))) (if v (cdr v) m)))
+   template t t))
+
+(defun nvemacs--homepage-write ()
+  "Write the home page file from its template; return the file, or nil."
+  (let ((tpl (nvemacs--homepage-template-file)) (file (nvemacs--homepage-file)))
+    (when tpl
+      (let ((text (nvemacs--homepage-expand
+                   (with-temp-buffer
+                     (let ((coding-system-for-read 'utf-8)) (insert-file-contents tpl))
+                     (buffer-string))
+                   (nvemacs--homepage-values (nvemacs--homepage-md-p)))))
+        (nvemacs--private-directory (file-name-directory file))
+        (with-temp-buffer (insert text) (nvemacs--write-file file))
+        file))))
+
+(defun nvemacs--homepage-save ()
+  "Write the home page if the index is open.  An error never stops an exit."
+  (when nvemacs--db
+    (with-demoted-errors "nvEmacs: writing the home page: %S"
+      (nvemacs--homepage-write))))
+
+(defun nvemacs--homepage-text ()
+  "Return the home page's text, first writing it if missing or out of date."
+  (let ((file (nvemacs--homepage-file)) (tpl (nvemacs--homepage-template-file)))
+    (when (and tpl (or (not (file-exists-p file)) (file-newer-than-file-p tpl file)))
+      (nvemacs--homepage-write))
+    (when (file-readable-p file)
+      (with-temp-buffer
+        (let ((coding-system-for-read 'utf-8)) (insert-file-contents file))
+        (buffer-string)))))
+
+(defun nvemacs--homepage-live ()
+  "Return the part of the page that must be current, shown above the file.
+A crash skips the exit write, so none of this can be stored in it."
+  (let* ((h (if (nvemacs--homepage-md-p) "# " "* "))
+         (run nvemacs--homepage-run)
+         (plural (lambda (n one many) (format "%d %s" n (if (= n 1) one many))))
+         (pending (length (nvemacs--pending-records)))
+         (orphans (if (plist-get run :checked) (length (nvemacs--orphan-tag-files)) 0))
+         (attention
+          (append
+           (when (> pending 0)
+             (list (concat (funcall plural pending "note has" "notes have")
+                           " unsaved edits: M-x nvemacs-edits-recover")))
+           (when nvemacs--skipped
+             (list (concat (funcall plural (length nvemacs--skipped)
+                                    "note could not be indexed" "notes could not be indexed")
+                           ": M-x nvemacs-index-skipped")))
+           (mapcar (lambda (d) (concat "Watched folder not found: " d))
+                   (cl-remove-if #'file-directory-p nvemacs-watched-directories))
+           (when (> orphans 0)
+             (list (concat (funcall plural orphans "tag file has no note" "tag files have no note")
+                           ": M-x nvemacs-report-index"))))))
+    (concat
+     (when (or (null nvemacs-watched-directories) (zerop (nvemacs--note-count)))
+       (concat h "Getting started\n\n"
+               "- Point nvEmacs at your notes: M-x customize-variable RET"
+               " nvemacs-watched-directories\n\n"))
+     (when attention
+       (concat h "Needs attention\n\n"
+               (mapconcat (lambda (a) (concat "- " a)) attention "\n") "\n\n"))
+     (when (plist-get run :checked)
+       (let ((n (plist-get run :new)) (c (plist-get run :changed)) (d (plist-get run :deleted)))
+         (concat h "Since last session\n\n"
+                 (if (zerop (+ n c d))
+                     "- No notes changed"
+                   (format "- %d added, %d changed, %d deleted" n c d))
+                 "\n\n"))))))
+
+(defun nvemacs--homepage-open-path (path)
+  "Open note PATH from the home page.
+The page is a plain file, so a path outside the notes is refused."
+  (if (and (file-regular-p path) (nvemacs--watched-note-p path))
+      (nvemacs--open-path path)
+    (message "%s" (nvemacs--command-text
+                   'nvemacs-homepage-open-link
+                   (format "requires a note in a watched folder, and %s is not" path)
+                   "Press g to refresh the page and then try another link"))))
+
+(defun nvemacs--homepage-link-path ()
+  "Return the path of the Org note link at point, or nil."
+  (let ((pos (point)) (found nil))
+    (save-excursion
+      (beginning-of-line)
+      (while (and (not found)
+                  (re-search-forward "\\[\\[file:\\([^]\n]+\\)\\]\\[[^]\n]*\\]\\]"
+                                     (line-end-position) t))
+        (when (and (<= (match-beginning 0) pos) (< pos (match-end 0)))
+          (setq found (match-string-no-properties 1)))))
+    found))
+
+(defun nvemacs--homepage-org-follow ()
+  "Open the note link at point; return non-nil if there is one.
+An `org-open-at-point-functions' entry: left to Org, a click would open
+the note in some other window instead of nvEmacs's pane."
+  (let ((path (nvemacs--homepage-link-path)))
+    (when path
+      (nvemacs--homepage-open-path path)
+      t)))
+
+(defun nvemacs-homepage-open-link ()
+  "Open the note whose title is at point on the home page."
+  (interactive)
+  (unless (nvemacs--homepage-org-follow)
+    (message "%s" (nvemacs--command-text 'nvemacs-homepage-open-link
+                                         "requires a note's title at the cursor"
+                                         "Move to a title and then re-run the command"))))
+
+(define-minor-mode nvemacs-homepage-mode
+  "The keys of the nvEmacs home page, which is read-only.
+RET on a note's title opens it.
+\\{nvemacs-homepage-mode-map}"
+  :lighter " home")
+
+(define-derived-mode nvemacs-homepage-md-mode special-mode "nvEmacs home"
+  "A home page from a Markdown template, with its markup hidden."
+  (setq-local truncate-lines t))
+
+(defun nvemacs--homepage-md-view ()
+  "Show this buffer's Markdown with the markup hidden and links as buttons."
+  (unless (derived-mode-p 'nvemacs-homepage-md-mode) (nvemacs-homepage-md-mode))
+  (save-excursion
+    (goto-char (point-min))
+    (while (re-search-forward "^\\(#+ \\).*$" nil t)
+      (add-face-text-property (match-beginning 0) (match-end 0) 'nvemacs-homepage-heading)
+      (put-text-property (match-beginning 1) (match-end 1) 'invisible t))
+    (goto-char (point-min))
+    (while (re-search-forward "`\\([^`\n]+\\)`" nil t)
+      (add-face-text-property (match-beginning 1) (match-end 1) 'nvemacs-homepage-code)
+      (put-text-property (match-beginning 0) (match-beginning 1) 'invisible t)
+      (put-text-property (match-end 1) (match-end 0) 'invisible t))
+    (goto-char (point-min))
+    (while (re-search-forward "\\[\\([^]\n]*\\)\\](<file:\\([^>\n]+\\)>)" nil t)
+      (let ((title (match-string 1)) (path (match-string 2)))
+        (replace-match "" t t)
+        (insert-text-button title 'follow-link t 'nvemacs-path path
+                            'action (lambda (b) (nvemacs--homepage-open-path
+                                                 (button-get b 'nvemacs-path))))))))
+
+(defvar org-startup-folded)
+(defvar org-hide-emphasis-markers)
+(defvar org-hide-leading-stars)
+(defvar org-open-at-point-functions)
+(declare-function org-mode "org" ())
+
+(defun nvemacs--homepage-org-view ()
+  "Show this buffer's Org text rendered by Org, with the markup hidden.
+The whole page shows however the user's Org starts, and nothing on it
+can set local variables."
+  (require 'org)
+  (unless (derived-mode-p 'org-mode)
+    (let ((enable-local-variables nil)
+          (org-startup-folded 'showeverything)
+          (org-hide-leading-stars t))
+      (org-mode))
+    (setq-local org-hide-leading-stars t org-hide-emphasis-markers t)
+    (add-hook 'org-open-at-point-functions #'nvemacs--homepage-org-follow nil t))
+  (font-lock-flush))
+
+(defun nvemacs--homepage-render ()
+  "Draw the home page buffer and return it, or nil with no page to show."
+  (let ((text (nvemacs--homepage-text)) (md (nvemacs--homepage-md-p)))
+    (when text
+      ;; Org takes about 200 ms to load: keep the list on screen meanwhile.
+      (unless (or md (featurep 'org)) (redisplay))
+      (with-current-buffer (get-buffer-create nvemacs--homepage-name)
+        (let ((inhibit-read-only t) (pos (point))
+              (starts (mapcar (lambda (w) (cons w (window-start w)))
+                              (get-buffer-window-list (current-buffer) nil t))))
+          (erase-buffer)
+          (insert (nvemacs--homepage-live) text)
+          (if md (nvemacs--homepage-md-view) (nvemacs--homepage-org-view))
+          (nvemacs-homepage-mode 1)
+          (setq buffer-read-only t)
+          (goto-char (min pos (point-max)))
+          (dolist (w starts) (set-window-start (car w) (min (cdr w) (point-max)))))
+        (current-buffer)))))
+
+(defun nvemacs--homepage-up-buffer (frame)
+  "Return the home page buffer if the page is up in FRAME, else nil.
+The page is up from when it is shown until a note is selected or
+opened.  A resize can take the pane away and bring it back: the frame
+parameter is what remembers the page meanwhile."
+  (when (nvemacs--fparam 'nvemacs-homepage-up frame)
+    (or (get-buffer nvemacs--homepage-name)
+        (with-demoted-errors "nvEmacs: showing the home page: %S"
+          (nvemacs--homepage-render)))))
+
+(defun nvemacs--homepage-display ()
+  "Put the home page up, from its top, in the note pane if there is one.
+With no room for a pane, it appears when the frame grows."
+  (nvemacs--set-fparam 'nvemacs-homepage-up t)
+  (let ((nw (nvemacs--note-window)))
+    (when nw
+      (with-demoted-errors "nvEmacs: showing the home page: %S"
+        (let ((buf (nvemacs--homepage-render)))
+          (if (not buf)
+              (message "%s" (nvemacs--command-text
+                             "The home page"
+                             (format "requires the template %s, which was not found"
+                                     nvemacs-homepage-template)
+                             "Set nvemacs-homepage-template to a template that exists"))
+            (set-window-buffer nw buf)
+            (set-window-start nw (with-current-buffer buf (point-min)))
+            (set-window-point nw (with-current-buffer buf (point-min)))))))))
+
+(defun nvemacs-homepage-show ()
+  "Show the home page, brought up to date, in the notecontent area.
+The cursor goes to the search line.  Selecting a note's row replaces
+the page."
+  (interactive)
+  (nvemacs-searchbar-return)
+  (unless (nvemacs--note-window)        ; list-only: the temporary pane of C-o
+    (nvemacs--set-fparam 'nvemacs-temp t)
+    (nvemacs--apply-layout)
+    (nvemacs--focus-query))
+  (nvemacs--homepage-save)
+  (nvemacs--homepage-display))
+
 (defun nvemacs ()
   "Start nvEmacs in this frame: take it over and show the newest notes.
 Each frame keeps its own arrangement; the search buffer is shared.
@@ -4446,6 +6210,8 @@ measured and logged (startup.jsonl)."
     (nvemacs--apply-layout)
     (when new
       (nvemacs--widths-start)
+      (nvemacs--sort-start)
+      (setq nvemacs--columns-now nil)   ; toggles last for one session
       (when nvemacs-instrumentation
         (setq nvemacs--startup (list :t0 t0 :call-time call-time :rebuilt rebuilt
                                      :index index-ms :cold (not nvemacs--started-in-process))))
@@ -4453,16 +6219,21 @@ measured and logged (startup.jsonl)."
       ;; The list is usable at once with the last-known index; the
       ;; reconcile runs in idle slices and refreshes it.
       (with-current-buffer nvemacs--buffer-name (nvemacs--search))
+      (setq nvemacs--homepage-run (list :index-ms index-ms
+                                        :list-ms (- (nvemacs--ms t0) index-ms)))
       (setq nvemacs--started-in-process t)
       (when nvemacs-reconcile-on-startup
         (setq nvemacs--sync-trigger 'startup)
         (nvemacs--sync-soon 0))
-      (nvemacs--discarded-prune)
-      (nvemacs--recover-notice))
+      (nvemacs--discarded-prune))
     (nvemacs--focus-query)
     (when nvemacs--startup
       (with-current-buffer nvemacs--buffer-name
-        (nvemacs--startup-finish (length nvemacs--shown) (nvemacs--screen-rows))))))
+        (nvemacs--startup-finish (length nvemacs--shown) (nvemacs--screen-rows))))
+    ;; Last: rendering may load Org, and the list is timed and shown first.
+    (when new
+      (when nvemacs-homepage-show-at-start (nvemacs--homepage-display))
+      (nvemacs--recover-notice))))
 
 (provide 'nvemacs)
 ;;; nvemacs.el ends here

@@ -1,18 +1,18 @@
-nvEmacs 0.0.2 — Commands
+nvEmacs 0.0.3 — Commands
 ========================
 
 Command names are nvemacs-OBJECT-VERB, so M-x nvemacs-tags- TAB lists
-every tag command. The objects are Notational Velocity's three areas —
+every tag command.  The objects are Notational Velocity's three areas —
 searchbar, notelist, notecontent — plus note (a note file), layout,
-index, tags and report.
+index, tags, report, edits and homepage.
 
 
 Keys in *nvEmacs*
 -----------------
 
   RET          Open the selected note: in the note pane with the cursor
-               in it (or full frame in the list-only arrangement). On an
-               empty search line: start a new, untitled note. When nothing
+               in it (or full frame in the list-only arrangement).  On an
+               empty search line: start a new, untitled note.  When nothing
                matches: create a note named after the search.
   C-o          Open the selected note in the note pane and move there.
                C-u C-o: show it but stay in the list.
@@ -20,11 +20,21 @@ Keys in *nvEmacs*
   S-TAB        Previous row, or back to the search line.
                                          (nvemacs-notelist-previous)
   Up / Down    Move between the search line and the rows, as in any
-  C-p / C-n    buffer. The note under the cursor is previewed in the pane
+  C-p / C-n    buffer.  The note under the cursor is previewed in the pane
                after 0.2 s.
-  mouse-1      Select the clicked row (on release).
+  mouse-1      Select the clicked row (on release).  On a column heading:
+               sort by it; click again to reverse.
+  C-c ^        Sort: one key chooses the column.  The sorted column, or ^,
+               reverses it.              (nvemacs-notelist-sort-column)
+  C-c C-x C-c  Show or hide columns for this session: each key toggles
+               one, RET ends, C-g puts them back.
+                                         (nvemacs-notelist-column-toggle)
   C-c C-c      Clear the search.         (nvemacs-searchbar-clear)
-  C-c C-n      New note titled with the search. (nvemacs-note-new)
+  C-c C-n      New note titled with the search.  (nvemacs-note-new)
+  C-c C-r      Rename the selected note.  (nvemacs-note-rename)
+  C-c C-w      Move it to another watched folder.  (nvemacs-note-move)
+  C-c C-x C-a  Move it to a folder nvEmacs does not watch.
+                                         (nvemacs-note-move-outside)
   C-c C-l      Fit the tags column to the rows shown so far and redraw in
                place; remembered for the next start.
                                          (nvemacs-notelist-refresh)
@@ -32,20 +42,25 @@ Keys in *nvEmacs*
                list -> auto.             (nvemacs-layout-cycle)
   C-c C-g      Re-scan the watched folders now and search again.
                                          (nvemacs-index-refresh)
-  C-c C-q      Exit nvEmacs: save and close the notes it opened, restore
+  C-c C-q      Edit the selected note's tags, as in Org.
+                                         (nvemacs-tags-edit)
+  C-c C-]      Exit nvEmacs: save and close the notes it opened, restore
                the frame's earlier windows, stop watching the folders.
                In one of several nvEmacs frames, leave only that frame.
-                                         (nvemacs-quit)
+               Works in a note too.      (nvemacs-quit)
 
 On the search line you may type, use DEL, M-DEL, C-y (yank) and C-c C-c,
-and move with C-a, C-e, C-f, C-b, M-f, M-b and the arrow keys. Other
+and move with C-a, C-e, C-f, C-b, M-f, M-b and the arrow keys.  Other
 editing commands (C-d, C-k, C-w, M-d, C-t, case changes, undo) are
-refused with a message. Result rows cannot be edited; notes are edited in
+refused with a message.  Result rows cannot be edited; notes are edited in
 their own buffers.
 
 While a row is selected, the search line shows that note's title (its
-bold part). Typing starts a new search; DEL, or moving back to the search
+bold part).  Typing starts a new search; DEL, or moving back to the search
 line, brings back what you had typed.
+
+Scroll bar, wheel and trackpad move only the view; the selected note
+stays.  See README.txt, "The selected note and the view".
 
 
 Keys in notes opened by nvEmacs (nvemacs-note-mode, " nv")
@@ -53,8 +68,10 @@ Keys in notes opened by nvEmacs (nvemacs-note-mode, " nv")
 
   C-c )        Back to nvEmacs, restoring its layout.
                                          (nvemacs-searchbar-return)
-  C-x C-s      Write the note, even if your edits were undone.
-                                         (nvemacs-note-save)
+  C-c C-]      Exit nvEmacs.             (nvemacs-quit)
+
+Every other key in a note keeps its usual meaning.  In an Org note,
+C-c C-q is Org's own tag command.
 
 
 Suggested global key (not bound by nvEmacs)
@@ -62,7 +79,7 @@ Suggested global key (not bound by nvEmacs)
 
   F8           (global-set-key [f8] #'nvemacs-searchbar-return)
                Go to nvEmacs from anywhere; from a note nvEmacs opened,
-               return with the layout restored. nvEmacs must be loaded
+               return with the layout restored.  nvEmacs must be loaded
                first, with (require 'nvemacs) or use-package's :bind:
                see README.txt, "Installing".
 
@@ -76,20 +93,33 @@ Starting and leaving
                                   and show the newest notes.
   nvemacs-searchbar-return        Return to nvEmacs from anywhere (F8,
                                   C-c ) in notes).
-  nvemacs-quit                    Exit nvEmacs (C-c C-q).
+  nvemacs-quit                    Exit nvEmacs (C-c C-]).
+  nvemacs-homepage-show           Show the home page, up to date.  On the
+                                  page: RET opens a note, g refreshes,
+                                  q returns to the search line.
+  nvemacs-homepage-open-link      Open the note whose title is at point (RET
+                                  on the home page).
 
 Notes
 
   nvemacs-note-open               Open the selected note (RET).
   nvemacs-note-open-other-window  Open it in the note pane (C-o).
-  nvemacs-note-save               Write this note, even if its edits were
-                                  undone (C-x C-s in a note).
   nvemacs-note-new                Create a note titled TITLE in the default
-                                  naming style and open it (C-c C-n). An
+                                  naming style and open it (C-c C-n).  An
                                   existing note of that name is opened
                                   instead; nothing is written until you
                                   save or leave it with something typed.
                                   Closed as it started, it is not kept.
+  nvemacs-note-rename             Rename the selected note's file (C-c C-r).
+                                  The text and date stay.  A new extension
+                                  must be a supported one, and is confirmed.
+  nvemacs-note-move               Move it to another watched folder
+                                  (C-c C-w).  The text and date stay.
+  nvemacs-note-move-outside       Move it to a folder nvEmacs does not watch
+                                  (C-c C-x C-a).  Asks first: the note leaves
+                                  the index.
+  nvemacs-note-delete             Move it to the system Trash, after asking.
+                                  Unsaved edits are kept for 7 days.
 
 Searchbar and notelist
 
@@ -102,6 +132,22 @@ Searchbar and notelist
                                   through Customize, and the width setting
                                   switches to `user' so it is kept.
 
+Sorting and columns
+
+  nvemacs-notelist-sort           Reverse the current sort (C-c ^ ^).
+  nvemacs-notelist-sort-column    Choose a column from a menu (C-c ^).
+  nvemacs-notelist-sort-title     Sort by that column; run it again to
+  nvemacs-notelist-sort-tags      reverse.  Title and tags start A to Z, the
+  nvemacs-notelist-sort-created   dates newest first.  The sort is remembered
+  nvemacs-notelist-sort-added     between sessions.
+  nvemacs-notelist-sort-modified
+  nvemacs-notelist-column-toggle  Show or hide columns from a menu
+                                  (C-c C-x C-c), for this session.
+  nvemacs-notelist-column-tags-toggle      Show or hide that column for this
+  nvemacs-notelist-column-created-toggle   session.  The title is always
+  nvemacs-notelist-column-added-toggle     shown.
+  nvemacs-notelist-column-modified-toggle
+
 Layout
 
   nvemacs-layout-cycle            Cycle this frame's arrangement (C-c C-v).
@@ -110,8 +156,8 @@ Tags
 
   nvemacs-tags-edit               Edit the selected note's file tags in the
                                   minibuffer (comma-separated, with
-                                  completion). In the form the note already
-                                  uses. Written, and indexed, when you leave
+                                  completion).  In the form the note already
+                                  uses.  Written, and indexed, when you leave
                                   the note or its row.
   nvemacs-tags-list               List every tag with how many notes have it.
 
@@ -120,6 +166,11 @@ Unsaved edits
   nvemacs-edits-recover           List edits left by a crash or forced quit.
                                   In the list: d compare with the note,
                                   RET use them, x discard them, g refresh.
+  nvemacs-edits-use               Put the edits on this line back into their
+                                  note, for you to review (RET or u).
+  nvemacs-edits-diff              Show how they differ from the note (d).
+  nvemacs-edits-discard           Discard them: they move to discarded/ for
+                                  7 days (x).
 
 Index
 
@@ -128,8 +179,8 @@ Index
   nvemacs-index-reconcile         Re-scan the watched folders now (metadata
                                   only) and re-index what changed.
   nvemacs-index-rebuild           Delete the index and build it from every
-                                  note. Created dates of undated notes are
-                                  kept (they live in dates.eld).
+                                  note.  Added dates are kept (they live in
+                                  dates.eld).
   nvemacs-index-skipped           List the notes that could not be indexed,
                                   and why (too large, binary, not UTF-8).
 
@@ -153,6 +204,10 @@ Modes
                                   (see SETTINGS.txt, Data and logs).
   nvemacs-mode                    Major mode of *nvEmacs* (set by nvemacs).
   nvemacs-note-mode               Minor mode in notes nvEmacs opened.
+  nvemacs-homepage-mode           Minor mode with the home page's keys.
+  nvemacs-homepage-md-mode        Major mode of a Markdown home page.  An Org
+                                  page uses org-mode.
+  nvemacs-edits-mode              Major mode of the list of unsaved edits.
 
 
 Search syntax
@@ -163,5 +218,6 @@ Search syntax
   tag:work          notes with a tag starting with "work"
   -tag:old          leave out notes with a tag starting with "old"
 
-Case and accents are ignored. Title matches (the first 60 columns of a
-title) are listed first, then the rest; each group newest first.
+Case and accents are ignored.  In the default sort, title matches (the
+first 60 columns of a title) come first, then the other matches, each
+group newest first.  Any other sort orders every match by its column.
