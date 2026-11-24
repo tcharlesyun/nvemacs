@@ -4,7 +4,7 @@
 
 ;; Author: T. Charles Yun
 ;; Assisted-by: LLM/Claude Code (2026)
-;; Version: 0.0.3
+;; Version: 0.0.4
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: convenience, text, notes, Notational Velocity
 ;; URL: https://github.com/tcharlesyun/nvemacs
@@ -37,6 +37,7 @@
 
 (require 'cl-lib)
 (require 'ucs-normalize)
+(require 'time-date)
 
 ;;;; Folding
 ;;
@@ -100,6 +101,17 @@ full-width ASCII -> ASCII.  Built on first use.")
     (goto-char (point-min))
     (while (re-search-forward nvemacs--combining-mark-regexp nil t)
       (replace-match "" t t))))
+
+(defun nvemacs--collapse-whitespace ()
+  "Make every whitespace run in the buffer one space.
+The two C primitives keep this cheap on a full rebuild."
+  (dolist (c '(?\n ?\t ?\r ?\f))
+    (subst-char-in-region (point-min) (point-max) c ?\s t))
+  (goto-char (point-min))
+  (while (search-forward "  " nil t)
+    (let ((second (point)))
+      (skip-chars-forward " ")
+      (delete-region (1- second) (point)))))
 
 (defun nvemacs--fold (string)
   "Return STRING folded for indexing or querying."
@@ -215,73 +227,81 @@ and what the notelist shows in bold."
              (match (string-trim-right (if (and sp (> sp 0)) (substring cut 0 sp) cut))))
         (cons match (string-trim (substring title (length match))))))))
 
-(defun nvemacs--parse-date (s)
-  "Seconds since 1970 (local time) of the date at the start of S, or nil.
-Accepts 2026-11-19-19h40m, 2024-05-01, 2024-05-01 10:30,
-2024-05-01T10:30, Org timestamps <2024-05-01 Wed 10:30> and [2024-05-01
-Wed], and quotes around any of them."
-  (when (and s (string-match
-                (concat "\\`[ \t\"'<[]*\\([0-9]\\{4\\}\\)-\\([0-9]\\{2\\}\\)-\\([0-9]\\{2\\}\\)"
-                        "\\(?:\\(?:[T-]\\|[ \t]+\\(?:[[:alpha:]]+\\.?[ \t]+\\)?\\)"
-                        "\\([0-9]\\{1,2\\}\\)[:h]\\([0-9]\\{2\\}\\)\\)?")
-                s))
-    (let ((y (string-to-number (match-string 1 s)))
-          (mo (string-to-number (match-string 2 s)))
-          (d (string-to-number (match-string 3 s)))
-          (h (if (match-beginning 4) (string-to-number (match-string 4 s)) 0))
-          (mi (if (match-beginning 5) (string-to-number (match-string 5 s)) 0)))
-      (when (and (<= 1 mo 12) (<= 1 d 31) (<= 0 h 23) (<= 0 mi 59))
-        (time-convert (encode-time (list 0 mi h d mo y nil -1 nil)) 'integer)))))
+(defconst nvemacs--date-regexp
+  (concat "\\`[ \t\"'<[]*\\([0-9]\\{4\\}\\)-\\([0-9]\\{2\\}\\)-\\([0-9]\\{2\\}\\)"
+          "\\(?:\\(?:[T-]\\|[ \t]+\\(?:[[:alpha:]]+\\.?[ \t]+\\)?\\)"
+          "\\([0-9]\\{1,2\\}\\)[:h]\\([0-9]\\{2\\}\\)"
+          "\\(?::\\([0-9]\\{2\\}\\)\\)?"
+          "\\(Z\\|[-+][0-9]\\{2\\}\\(?::?[0-9]\\{2\\}\\)?\\)?\\)?")
+  "A date, an optional time and an optional offset, at the start of a string.
+Groups: 1 year, 2 month, 3 day, 4 hour, 5 minute, 6 second, 7 offset.")
 
-(defun nvemacs--filename-date (path)
-  "Return the created date, in seconds, from the start of PATH's filename.
+(defun nvemacs--zone-seconds (zone)
+  "Return ZONE, `Z', `+13:00' or `-0800', in seconds east of UTC, or nil."
+  (if (equal zone "Z")
+      0
+    (let* ((digits (string-replace ":" "" (substring zone 1)))
+           (hh (string-to-number (substring digits 0 2)))
+           (mm (if (> (length digits) 2) (string-to-number (substring digits 2)) 0)))
+      (when (and (<= hh 14) (<= mm 59))
+        (* (if (eq (aref zone 0) ?-) -1 1) (+ (* hh 3600) (* mm 60)))))))
+
+(defun nvemacs--date-parts (s)
+  "Return the date at the start of S as (WALL . OFFSET), or nil.
+WALL is the clock time as written, in seconds as if it were UTC, so it
+reads the same in every time zone.  OFFSET is the zone the text gives,
+in seconds east of UTC, or nil for local time.  Accepts
+2026-11-23-10:30:45, 2026-11-19-19h40m, 2024-05-01, 2024-05-01 10:30,
+2024-05-01T10:30:45-08:00, Org timestamps <2024-05-01 Wed 10:30> and
+\[2024-05-01 Wed], and quotes around any of them.  An Org timestamp has
+no offset: its `10:30-11:30' is a time range."
+  (when s
+    (let ((case-fold-search nil))
+      (when (string-match nvemacs--date-regexp s)
+        (let* ((num (lambda (g) (if (match-beginning g) (string-to-number (match-string g s)) 0)))
+               (y (funcall num 1)) (mo (funcall num 2)) (d (funcall num 3))
+               (h (funcall num 4)) (mi (funcall num 5)) (sec (funcall num 6))
+               (org (and (> (match-beginning 1) 0)
+                         (memq (aref s (1- (match-beginning 1))) '(?< ?\[))))
+               (end (match-end 7))
+               (zone (and end (not org)
+                          (or (= end (length s))
+                              (not (string-match-p "[[:alnum:]]" (substring s end (1+ end)))))
+                          (match-string 7 s))))
+          (when (and (<= 1 mo 12) (<= 1 d (date-days-in-month y mo))
+                     (<= 0 h 23) (<= 0 mi 59) (<= 0 sec 59))
+            (cons (time-convert (encode-time (list sec mi h d mo y nil nil 0)) 'integer)
+                  (and zone (nvemacs--zone-seconds zone)))))))))
+
+(defun nvemacs--date-moment (parts)
+  "Return PARTS, (WALL . OFFSET), as seconds since 1970.
+A date with no offset is read in the current time zone."
+  (if (cdr parts)
+      (- (car parts) (cdr parts))
+    (pcase-let ((`(,s ,mi ,h ,d ,mo ,y) (decode-time (car parts) 0)))
+      (time-convert (encode-time (list s mi h d mo y nil -1 nil)) 'integer))))
+
+(defun nvemacs--parse-date (s)
+  "Seconds since 1970 of the date at the start of S, or nil.
+See `nvemacs--date-parts' for the forms it reads."
+  (let ((parts (nvemacs--date-parts s)))
+    (and parts (nvemacs--date-moment parts))))
+
+(defun nvemacs--filename-date-parts (path)
+  "Return the date at the start of PATH's filename as (WALL . OFFSET), or nil.
 The filename must start with a timestamp such as 2024-05-01 or
-2024-05-01-10h00m.  Return nil if it does not."
+2024-05-01-10h00m."
   (let ((base (file-name-nondirectory path)))
     (and (> (length base) 9) (<= ?0 (aref base 0) ?9)   ; no regexp for most names
          (string-match-p (concat "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}"
                                  "\\(?:-[0-9]\\{2\\}h[0-9]\\{2\\}m\\)?\\(?:[-_ .]\\|\\'\\)")
                          base)
-         (nvemacs--parse-date base))))
+         (nvemacs--date-parts base))))
 
-(defun nvemacs--org-created (limit)
-  "Return the declared created date of the Org text in the current buffer.
-That is a #+created: keyword or a :CREATED: property (file-level or in
-the first heading), then #+date:.  Keywords count only before LIMIT,
-the first heading.  Values that cannot be parsed are passed over."
-  (let ((case-fold-search t) (created nil) (date nil))
-    (save-excursion
-      (goto-char (point-min))
-      (while (and (not created) (re-search-forward "^#\\+\\(created\\|date\\):[ \t]*\\(.*\\)$" limit t))
-        (let* ((key (match-string 1))                ; before parse-date's string-match
-               (v (nvemacs--parse-date (match-string 2))))
-          (if (string-equal-ignore-case key "created")
-              (setq created v)
-            (setq date (or date v)))))
-      (or created
-          (progn
-            (goto-char (point-min))
-            (let ((second (save-excursion
-                            (goto-char limit)
-                            (if (and (< limit (point-max)) (zerop (forward-line 1))
-                                     (re-search-forward "^\\*+[ \t]" nil t))
-                                (match-beginning 0)
-                              (point-max))))
-                  (found nil))
-              (while (and (not found) (re-search-forward "^[ \t]*:CREATED:[ \t]*\\(.*\\)$" second t))
-                (setq found (nvemacs--parse-date (match-string 1))))
-              found))
-          date))))
-
-(defun nvemacs--front-matter-created (inside toml)
-  "Declared created date in front matter text INSIDE: created, then date.
-TOML non-nil means TOML lines (key = value), else YAML (key: value)."
-  (let ((case-fold-search t))
-    (cl-some (lambda (key)
-               (and (string-match (format (if toml "^%s[ \t]*=[ \t]*\\(.*\\)$" "^%s:[ \t]*\\(.*\\)$") key)
-                                  inside)
-                    (nvemacs--parse-date (match-string 1 inside))))
-             '("created" "date"))))
+(defun nvemacs--filename-date (path)
+  "Return the created date, in seconds, from the start of PATH's filename."
+  (let ((parts (nvemacs--filename-date-parts path)))
+    (and parts (nvemacs--date-moment parts))))
 
 (defun nvemacs--norm-line (s)
   "S without heading markers, case, punctuation, `_' or extra spaces."
@@ -321,7 +341,6 @@ regexps: see `nvemacs--org-heading-regexp'."
       (insert text)
       (goto-char (point-min))
       (pcase source
-        ('org-keyword (when (re-search-forward "^#\\+title:[ \t]*\\(.*\\)$" nil t) (nvemacs--delete-line)))
         ('heading (when (re-search-forward (if org "^\\*+[ \t]" "^#[ \t]") nil t) (nvemacs--delete-line)))
         ('first-line (skip-chars-forward " \t\n") (nvemacs--delete-line)))
       (goto-char (point-min))
@@ -452,21 +471,49 @@ See `nvemacs-tags-in-file-extensions'."
                 (file-attributes (nvemacs--sister path)))))
     (if a (nvemacs--mtime-us a) 0)))
 
-(defun nvemacs--org-first-heading ()
-  "Return the position of the first Org heading, or `point-max' if none."
+(defconst nvemacs--org-block-regexp
+  "[ \t]*#\\+begin_\\(src\\|example\\|export\\|comment\\)\\(?:[ \t]\\|$\\)"
+  "The first line of an Org block whose lines are not keywords or comments.
+Group 1 is the block's type.  Use it with `case-fold-search' on.")
+
+(defun nvemacs--org-drawer-end ()
+  "With point on a `:PROPERTIES:' line, return the start of the line after `:END:'.
+Return nil if the drawer is not closed."
+  (save-excursion
+    (forward-line 1)
+    (when (re-search-forward "^[ \t]*:END:[ \t]*$" nil t)
+      (min (point-max) (1+ (point))))))
+
+(defun nvemacs--org-header-end ()
+  "Return where the header of the Org text in the current buffer ends.
+The header is the block of lines up to the first blank line, which may
+hold only spaces.  Blank lines before it are skipped, a `:PROPERTIES:'
+drawer counts as one unit, and a heading or a code block also ends it.
+Title, Created, Date and file tags count only here."
   (save-excursion
     (goto-char (point-min))
-    (if (re-search-forward "^\\*+[ \t]" nil t) (match-beginning 0) (point-max))))
+    (skip-chars-forward " \t\r\n")
+    (beginning-of-line)
+    (let ((case-fold-search t) (done nil))
+      (while (and (not done) (not (eobp)))
+        (cond
+         ((or (looking-at "[ \t\r]*$") (looking-at "\\*+[ \t]")
+              (looking-at nvemacs--org-block-regexp))
+          (setq done t))
+         ((looking-at "[ \t]*:PROPERTIES:[ \t]*$")
+          (goto-char (or (nvemacs--org-drawer-end) (line-beginning-position 2))))
+         (t (forward-line 1))))
+      (point))))
 
 (defun nvemacs--org-tags-in-buffer ()
   "Return the tags of the Org text in the current buffer.
-These are the `#+filetags:' lines before the first heading (any case;
-several combine), as (TAG . file), and the heading tags, as
+These are the `#+filetags:' lines of the header (any case; several
+combine), as (TAG . file), and the heading tags, as
 \(TAG . section).  A commented-out `# +filetags:' does not count."
   (save-excursion
-    (let ((case-fold-search t) (limit (nvemacs--org-first-heading)) (out nil))
+    (let ((case-fold-search t) (limit (nvemacs--org-header-end)) (out nil))
       (goto-char (point-min))
-      (while (re-search-forward "^#\\+filetags:[ \t]*\\(.*\\)$" limit t)
+      (while (re-search-forward "^[ \t]*#\\+filetags:[ \t]*\\(.*\\)$" limit t)
         (dolist (tg (split-string (match-string-no-properties 1) "[: \t]+" t))
           (push (cons tg 'file) out)))
       (goto-char (point-min))
@@ -477,17 +524,22 @@ several combine), as (TAG . file), and the heading tags, as
 
 (defun nvemacs--md-front-matter ()
   "Front matter at the start of the buffer as (TYPE BEG END IBEG IEND):
-TYPE `yaml' (---) or `toml' (+++); BEG..END the whole block up to the end
-of its closing line; IBEG..IEND its inside (IEND = start of closing line)."
+TYPE `yaml' (---), `toml' (+++) or `json' ({ on its own line); BEG..END
+the whole block up to the end of its closing line; IBEG..IEND its inside
+\(IEND = start of closing line)."
   (save-excursion
     (goto-char (point-min))
-    (let ((type (cond ((looking-at "---[ \t]*\n") 'yaml)
-                      ((looking-at "\\+\\+\\+[ \t]*\n") 'toml))))
-      (when type
-        (let ((ibeg (match-end 0)))
-          (goto-char ibeg)
-          (when (re-search-forward (if (eq type 'yaml) "^---[ \t]*$" "^\\+\\+\\+[ \t]*$") nil t)
-            (list type (point-min) (match-end 0) ibeg (match-beginning 0))))))))
+    (if (looking-at "{[ \t]*\n")
+        (let* ((ibeg (match-end 0))
+               (end (ignore-errors (json-parse-buffer) (point))))
+          (when end (list 'json (point-min) end ibeg (1- end))))
+      (let ((type (cond ((looking-at "---[ \t]*\n") 'yaml)
+                        ((looking-at "\\+\\+\\+[ \t]*\n") 'toml))))
+        (when type
+          (let ((ibeg (match-end 0)))
+            (goto-char ibeg)
+            (when (re-search-forward (if (eq type 'yaml) "^---[ \t]*$" "^\\+\\+\\+[ \t]*$") nil t)
+              (list type (point-min) (match-end 0) ibeg (match-beginning 0)))))))))
 
 (defun nvemacs--md-unquote (s)
   "Return S trimmed and without one pair of matching outer quotes."
@@ -501,16 +553,19 @@ of its closing line; IBEG..IEND its inside (IEND = start of closing line)."
 (defun nvemacs--md-tags-entry (fm)
   "Return the `tags' entry of front matter FM, or nil.
 FM is as `nvemacs--md-front-matter' returns it.  The entry is a plist:
-:tags (strings), :form (`flow', `block', `comma', `space' or `toml'),
+:tags (strings), :form (`flow', `block', `comma', `space', `toml' or `json'),
 :beg and :end (the text to replace) and :indent (block form)."
   (save-excursion
     (let ((case-fold-search t) (iend (nth 4 fm)))
       (goto-char (nth 3 fm))
-      (if (eq (car fm) 'toml)
-          (when (re-search-forward "^tags[ \t]*=[ \t]*\\[\\(.*\\)\\][ \t]*$" iend t)
+      (if (memq (car fm) '(toml json))
+          (when (re-search-forward (if (eq (car fm) 'toml)
+                                       "^tags[ \t]*=[ \t]*\\[\\(.*\\)\\][ \t]*$"
+                                     "\"tags\"[ \t\n]*:[ \t\n]*\\[\\([^]]*\\)\\]")
+                                   iend t)
             ;; Positions first: `split-string' in the items call resets match data.
             (let ((beg (match-beginning 0)) (end (match-end 0)))
-              (list :tags (nvemacs--md-list-items (match-string-no-properties 1)) :form 'toml
+              (list :tags (nvemacs--md-list-items (match-string-no-properties 1)) :form (car fm)
                     :beg beg :end end)))
         (when (re-search-forward "^tags:[ \t]*\\(.*?\\)[ \t]*$" iend t)
           (let ((v (match-string-no-properties 1))
@@ -542,6 +597,314 @@ Each tag is (TAG . file)."
     (mapcar (lambda (tg) (cons tg 'file))
             (plist-get (and fm (nvemacs--md-tags-entry fm)) :tags))))
 
+;;;; Note fields: keys, values and header comments
+;;
+;; Every key in a note is captured, whatever its name.  A field is
+;; (KEY VALUE KIND POS): KIND is `header', `body', or `comment' for a header
+;; comment, which has no KEY; POS is where it is in the file.  Plain search
+;; never sees them; `key:' reads the names and `meta:' the values and header
+;; comments.  The design is in the project's note_fields notes.
+
+(defcustom nvemacs-search-comments nil
+  "Non-nil means comments in a note's body are part of plain search.
+Comments follow the file type: in Org a `#' line and a comment block, in
+Markdown `<!-- -->'; text files have none.  The comments of an Org header
+stay out either way.  \[nvemacs-index-comments] turns this on or off,
+rebuilds the index and remembers the choice, which then wins over this
+value.  Set here, a change takes effect when the index is rebuilt, which
+nvEmacs offers at its next start."
+  :type 'boolean)
+
+(defvar nvemacs--comments-held nil
+  "(VALUE) of the comment setting the index holds, while the user keeps it.
+Set when the user declines the rebuild, so that notes indexed later
+agree with the rest of the index.")
+
+(defun nvemacs--comments-on ()
+  "Non-nil if comments are indexed with the body."
+  (if nvemacs--comments-held (car nvemacs--comments-held) nvemacs-search-comments))
+
+(defun nvemacs--strip-regions (regions &optional filler)
+  "Delete REGIONS, ((BEG . END) ...), from the buffer, putting FILLER in each."
+  (dolist (r (sort (copy-sequence regions) (lambda (a b) (> (car a) (car b)))))
+    (delete-region (car r) (cdr r))
+    (when filler (goto-char (car r)) (insert filler))))
+
+(defun nvemacs--date-problems (titles created dates has-keys)
+  "Return the header problems of a note and its date, as (PROBLEMS . PARTS).
+TITLES, CREATED and DATES are the non-blank values, ((VALUE . POS) ...),
+in file order.  HAS-KEYS means the note has a header with keys.  A
+problem is (KIND LINE DETAIL).  PARTS is the note's date: the first
+readable Created, then the first readable Date."
+  (let* ((line (lambda (pos) (and pos (line-number-at-pos pos))))
+         (parts (or (cl-some (lambda (v) (nvemacs--date-parts (car v))) created)
+                    (cl-some (lambda (v) (nvemacs--date-parts (car v))) dates)))
+         (dated (append created dates))
+         (out nil))
+    (dolist (c `((several-title . ,titles) (several-created . ,created) (several-date . ,dates)))
+      (when (cddr c)
+        (push (list (car c) (funcall line (cdr (nth 2 c))) nil) out)))
+    (cond ((and (null dated) has-keys) (push (list 'missing-date nil nil) out))
+          ((and dated (null parts))
+           (push (list 'unreadable-date (funcall line (cdar dated)) (caar dated)) out)))
+    (cons (nreverse out) parts)))
+
+(defun nvemacs--org-scan ()
+  "Read the keys and comments of the Org text in the current buffer.
+Return a plist: :fields, the note's fields; :strip, the regions that are
+not body text; :comments, the body's comments; :title and :date, from the
+header; :problems.  The buffer is not changed.  One regexp finds the few
+lines that matter, so a long note costs little (see
+`nvemacs--org-heading-regexp')."
+  (let ((case-fold-search t)
+        (header-end (nvemacs--org-header-end))
+        fields strip comments titles created dates outside has-keys)
+    (save-excursion
+      (goto-char (point-min))
+      (skip-chars-forward " \t\r\n")
+      (beginning-of-line)
+      ;; A bare mode line, such as `; -*-Org-*-'.
+      (when (and (< (point) header-end) (looking-at "[^#\n]*-\\*-.*-\\*-.*$"))
+        (push (list nil (string-trim (match-string-no-properties 0)) "comment" (point)) fields)
+        (push (cons (point) (line-beginning-position 2)) strip))
+      (goto-char (point-min))
+      (while (re-search-forward "^[ \t]*\\(?:#\\|:PROPERTIES:\\)" nil t)
+        (beginning-of-line)
+        (let* ((bol (point)) (next (line-beginning-position 2)) (in-header (< bol header-end)))
+          (cond
+           ((looking-at nvemacs--org-block-regexp)
+            (let* ((type (downcase (match-string 1)))
+                   (end (save-excursion
+                          (forward-line 1)
+                          (and (re-search-forward (concat "^[ \t]*#\\+end_" type "[ \t]*$") nil t)
+                               (min (point-max) (1+ (point)))))))
+              (when (and end (equal type "comment")) (push (cons bol end) comments))
+              (goto-char (or end next))))
+           ((looking-at "[ \t]*#\\+\\([^ \t\n:]+\\):[ \t]*\\(.*\\)$")
+            (let* ((key (match-string-no-properties 1))
+                   (val (string-trim (match-string-no-properties 2)))
+                   (up (upcase key)))
+              (push (cons bol next) strip)
+              (unless (equal up "END")
+                (push (list key val (if in-header "header" "body") bol) fields)
+                (cond
+                 ((not (member up '("TITLE" "CREATED" "DATE" "FILETAGS"))))
+                 ((not in-header) (push (list up bol) outside))
+                 ((string-empty-p val))
+                 ((equal up "TITLE") (push (cons val bol) titles))
+                 ((equal up "CREATED") (push (cons val bol) created))
+                 ((equal up "DATE") (push (cons val bol) dates)))
+                (when in-header (setq has-keys t))))
+            (goto-char next))
+           ((looking-at "[ \t]*#\\(?:[ \t]+\\|$\\)")
+            (if in-header
+                (let ((text (string-trim (buffer-substring-no-properties (match-end 0) (max (match-end 0) (1- next))))))
+                  (push (cons bol next) strip)
+                  (unless (string-empty-p text)
+                    (push (list nil text "comment" bol) fields)))
+              (push (cons bol next) comments))
+            (goto-char next))
+           ((looking-at "[ \t]*:PROPERTIES:[ \t]*$")
+            (let ((end (nvemacs--org-drawer-end)))
+              (forward-line 1)
+              (when end
+                (while (< (point) end)
+                  (when (looking-at "[ \t]*:\\([^ \t\n:]+\\):[ \t]*\\(.*\\)$")
+                    (let ((key (match-string-no-properties 1))
+                          (val (string-trim (match-string-no-properties 2))))
+                      (unless (string-equal-ignore-case key "END")
+                        (push (list key val (if in-header "header" "body") (point)) fields)
+                        (when in-header
+                          (setq has-keys t)
+                          (when (and (string-equal-ignore-case key "CREATED")
+                                     (not (string-empty-p val)))
+                            (push (cons val (point)) created))))))
+                  (forward-line 1))
+                (push (cons bol end) strip))))
+           (t (goto-char next)))))
+      ;; A #+Created: comes before a drawer's :CREATED:, as written or not.
+      (let* ((titles (nreverse titles))
+             (created (sort (nreverse created)
+                            (lambda (a b)
+                              (and (save-excursion (goto-char (cdr a)) (looking-at "[ \t]*#"))
+                                   (save-excursion (goto-char (cdr b)) (looking-at "[ \t]*:"))))))
+             (checked (nvemacs--date-problems titles created (nreverse dates) has-keys))
+             (late (mapcar (lambda (o)
+                             (list (intern (concat (downcase (car o)) "-outside"))
+                                   (line-number-at-pos (cadr o)) nil))
+                           (nreverse outside))))
+        (list :fields (nreverse fields) :strip strip :comments comments
+              :title (caar titles) :date (cdr checked)
+              :problems (append late (car checked)))))))
+
+(defun nvemacs--value-scalar (s)
+  "Return front-matter value S without quotes or a trailing comment."
+  (let ((s (string-trim s)))
+    (cond ((string-match "\\`\\([\"']\\)\\(.*?\\)\\1\\(?:[ \t]+#.*\\)?\\'" s) (match-string 2 s))
+          ((string-match "[ \t]+#.*\\'" s) (substring s 0 (match-beginning 0)))
+          (t s))))
+
+(defun nvemacs--yaml-fields (beg end)
+  "Return the fields of the YAML between BEG and END.
+This is a limited reader for the common shapes: nested keys become
+`author.name', each list item is a value, and block strings are joined.
+A line it cannot read stays as a value of the key above it, so its text
+can still be found."
+  (save-excursion
+    (goto-char beg)
+    (let (out stack last)
+      (while (< (point) end)
+        (let ((pos (point)))
+          (cond
+           ((looking-at "[ \t]*$"))
+           ((looking-at "[ \t]*#[ \t]*\\(.*\\)$")
+            (push (list nil (string-trim (match-string-no-properties 1)) "comment" pos) out))
+           ((looking-at (concat "\\([ \t]*\\)\\(-[ \t]+\\)?"
+                                "\\(\"[^\"\n]+\"\\|'[^'\n]+'\\|[^ \t\n:#\"'-][^:\n]*?\\)"
+                                "[ \t]*:\\(?:[ \t]+\\(.*\\)\\)?$"))
+            (let* ((i (+ (length (match-string 1)) (length (or (match-string 2) ""))))
+                   (key (nvemacs--md-unquote (match-string-no-properties 3)))
+                   (raw (string-trim (or (match-string-no-properties 4) ""))))
+              (while (and stack (>= (caar stack) i)) (pop stack))
+              (let ((full (if stack (concat (cdar stack) "." key) key)))
+                (setq last full)
+                (cond
+                 ((string-empty-p raw)
+                  (push (cons i full) stack)
+                  (push (list full "" "header" pos) out))
+                 ((string-match-p "\\`[|>][-+0-9]*\\'" raw)
+                  (let (lines)
+                    (forward-line 1)
+                    (while (and (< (point) end)
+                                (or (looking-at "[ \t]*$")
+                                    (progn (looking-at "[ \t]*")
+                                           (> (- (match-end 0) (match-beginning 0)) i))))
+                      (push (string-trim (buffer-substring-no-properties (point) (line-end-position))) lines)
+                      (forward-line 1))
+                    (forward-line -1)
+                    (push (list full (string-join (delete "" (nreverse lines)) " ") "header" pos) out)))
+                 ((string-match "\\`\\[\\(.*\\)\\]\\'" raw)
+                  (dolist (it (nvemacs--md-list-items (match-string 1 raw)))
+                    (push (list full it "header" pos) out)))
+                 (t (push (list full (nvemacs--value-scalar raw) "header" pos) out))))))
+           ((looking-at "\\([ \t]*\\)-[ \t]+\\(.*\\)$")
+            (let ((i (length (match-string 1)))
+                  (val (nvemacs--value-scalar (match-string-no-properties 2))))
+              (while (and stack (> (caar stack) i)) (pop stack))
+              (let ((key (cdar stack)))
+                (push (list key val (if key "header" "comment") pos) out))))
+           (t (push (list last (string-trim (buffer-substring-no-properties (point) (line-end-position)))
+                          (if last "header" "comment") pos)
+                    out))))
+        (forward-line 1))
+      ;; A key that only holds other keys is not a value of its own.
+      (let ((all out))
+        (nreverse
+         (cl-remove-if
+          (lambda (r)
+            (and (car r) (string-empty-p (cadr r))
+                 (cl-some (lambda (o)
+                            (and (car o)
+                                 (or (string-prefix-p (concat (car r) ".") (car o))
+                                     (and (equal (car o) (car r))
+                                          (not (string-empty-p (cadr o)))))))
+                          all)))
+          out))))))
+
+(defun nvemacs--toml-fields (beg end)
+  "Return the fields of the TOML between BEG and END.
+A limited reader: `[table]' prefixes its keys, and each array item is a
+value.  A line it cannot read stays as a value without a key."
+  (save-excursion
+    (goto-char beg)
+    (let (out prefix)
+      (while (< (point) end)
+        (let ((pos (point)))
+          (cond
+           ((looking-at "[ \t]*$"))
+           ((looking-at "[ \t]*#[ \t]*\\(.*\\)$")
+            (push (list nil (string-trim (match-string-no-properties 1)) "comment" pos) out))
+           ((looking-at "[ \t]*\\[\\[?[ \t]*\\([^]\n]+?\\)[ \t]*\\]\\]?[ \t]*$")
+            (setq prefix (match-string-no-properties 1)))
+           ((looking-at "[ \t]*\\(\"[^\"\n]+\"\\|'[^'\n]+'\\|[^ \t\n=#]+\\)[ \t]*=[ \t]*\\(.*\\)$")
+            (let* ((key (nvemacs--md-unquote (match-string-no-properties 1)))
+                   (raw (string-trim (match-string-no-properties 2)))
+                   (full (if prefix (concat prefix "." key) key)))
+              (when (and (string-prefix-p "[" raw) (not (string-search "]" raw)))
+                (while (and (not (string-search "]" raw)) (zerop (forward-line 1)) (< (point) end))
+                  (setq raw (concat raw " " (string-trim (buffer-substring-no-properties
+                                                          (point) (line-end-position)))))))
+              (if (string-match "\\`\\[\\(.*\\)\\]" raw)
+                  (dolist (it (nvemacs--md-list-items (match-string 1 raw)))
+                    (push (list full it "header" pos) out))
+                (push (list full (nvemacs--value-scalar raw) "header" pos) out))))
+           (t (push (list nil (string-trim (buffer-substring-no-properties (point) (line-end-position)))
+                          "comment" pos)
+                    out))))
+        (forward-line 1))
+      (nreverse out))))
+
+(defun nvemacs--json-fields (beg)
+  "Return the fields of the JSON object at BEG, flattened like YAML."
+  (save-excursion
+    (goto-char beg)
+    (let ((out nil))
+      (cl-labels ((walk (key v)
+                    (cond
+                     ((vectorp v) (mapc (lambda (x) (walk key x)) v))
+                     ((consp v)
+                      (dolist (kv v)
+                        (let ((name (symbol-name (car kv))))
+                          (walk (if key (concat key "." name) name) (cdr kv)))))
+                     (t (push (list key
+                                    (cond ((stringp v) (string-trim v))
+                                          ((numberp v) (number-to-string v))
+                                          ((eq v t) "true")
+                                          ((eq v :false) "false")
+                                          (t ""))
+                                    "header" nil)
+                              out)))))
+        (walk nil (json-parse-buffer :object-type 'alist :null-object :null :false-object :false)))
+      (nreverse out))))
+
+(defun nvemacs--md-scan (fm)
+  "Read front matter FM.  Return a plist of :fields, :title, :date, :problems."
+  (let* ((fields (pcase (car fm)
+                   ('json (nvemacs--json-fields (nth 1 fm)))
+                   ('toml (nvemacs--toml-fields (nth 3 fm) (nth 4 fm)))
+                   (_ (nvemacs--yaml-fields (nth 3 fm) (nth 4 fm)))))
+         (values-of (lambda (name)
+                      (cl-loop for f in fields
+                               when (and (car f) (string-equal-ignore-case (car f) name)
+                                         (not (string-empty-p (nth 1 f))))
+                               collect (cons (nth 1 f) (nth 3 f)))))
+         (titles (funcall values-of "title"))
+         (checked (nvemacs--date-problems titles (funcall values-of "created")
+                                          (funcall values-of "date")
+                                          (and (cl-some #'car fields) t))))
+    (list :fields fields :title (caar titles) :date (cdr checked) :problems (car checked))))
+
+(defun nvemacs--md-comments ()
+  "Return the regions of `<!-- -->' comments in the Markdown buffer.
+Those inside a code fence are code, and an unclosed comment is text."
+  (save-excursion
+    (goto-char (point-min))
+    (when (search-forward "<!--" nil t)
+      (goto-char (point-min))
+      (let ((fence nil) (out nil) (stop nil))
+        (while (and (not stop)
+                    (re-search-forward "^[ \t]*\\(?:```\\|~~~\\)\\|<!--" nil t))
+          (cond
+           ((not (equal (match-string 0) "<!--"))
+            (setq fence (not fence))
+            (forward-line 1))
+           (fence nil)
+           (t (let ((beg (match-beginning 0)))
+                (if (search-forward "-->" nil t)
+                    (push (cons beg (point)) out)
+                  (setq stop t))))))
+        out))))
+
 (defun nvemacs--sister-tags (path)
   "Return the file tags in PATH's sister file.
 The file holds one tag per line; lines starting with `# ' are comments,
@@ -570,63 +933,56 @@ and blank lines are ignored."
 (defun nvemacs--import-buffer (path)
   "Return the index record of the note in the current buffer.
 PATH is the file it was read from.  The record is (TITLE FOLDED-MATCH
-FOLDED-TEXT OTHER-P TAGS PREVIEW CREATED):
+FOLDED-TEXT OTHER-P TAGS PREVIEW CREATED CREATED-PARTS FIELDS PROBLEMS):
 TITLE, the full title for display (up to `nvemacs--title-store-max');
 FOLDED-MATCH, its match part (`nvemacs--match-title'), folded, for the
 title tables;
-FOLDED-TEXT, the note's text, folded;
+FOLDED-TEXT, the note's text, folded, each whitespace run one space so a
+quoted phrase matches across line breaks;
 OTHER-P, non-nil if the text holds CJK characters (the `other' tables);
 TAGS, the tags found in the text (Org, Markdown), ((TAG . KIND) ...);
 PREVIEW, the body as one line (`nvemacs--preview');
-CREATED, the declared created date in seconds, or nil.
+CREATED, the declared created date in seconds, or nil;
+CREATED-PARTS, that date as written, (WALL . OFFSET): `nvemacs--date-parts';
+FIELDS, the note's keys and header comments (see `nvemacs--org-scan');
+PROBLEMS, what is wrong with its header, ((KIND LINE DETAIL) ...).
 The buffer is modified."
   (let* ((case-fold-search t)
          (ext (downcase (or (file-name-extension path) "")))
          (in-file-title nil)
          (heading nil)
          (tags nil)
-         (created nil))
+         (created nil)
+         (fields nil)
+         (problems nil))
     ;; Per-extension filters, built in for Org and Markdown.
     (goto-char (point-min))
     (cond
      ((equal ext "org")
       (setq tags (nvemacs--org-tags-in-buffer))   ; before keyword lines go
-      ;; #+title: counts only before the first heading (not one quoted in a
-      ;; block further down).
-      (let ((first-heading (save-excursion
-                             (if (re-search-forward "^\\*+[ \t]" nil t) (match-beginning 0) (point-max)))))
-        (when (re-search-forward "^#\\+title:[ \t]*\\(.*\\)$" first-heading t)
-          (setq in-file-title (string-trim (match-string 1))))
-        (setq created (nvemacs--org-created first-heading)))
-      (setq heading (nvemacs--org-heading))
-      (goto-char (point-min))
-      (while (re-search-forward
-              "^[ \t]*:PROPERTIES:[ \t]*\n\\(?:.*\n\\)*?[ \t]*:END:[ \t]*$" nil t)
-        (replace-match ""))
-      (goto-char (point-min))
-      ;; `#+KEY:' lines other than the title, and commented-out keywords
-      ;; `# +KEY:' (deliberate comments, not indexed).
-      ;; Ordinary `# comment' lines are the user's text and stay. An EMPTY
-      ;; `#+Title:' (new untitled note from a template) goes too: it is no
-      ;; title, and kept it became the "first line" title (bug 2026-11-19).
-      (while (re-search-forward "^#\\(?: \\)?\\+\\([A-Za-z_]+\\):\\(.*\\)$" nil t)
-        (unless (and (string-equal-ignore-case (match-string 1) "title")
-                     (not (string-prefix-p "# " (match-string 0)))
-                     (not (string-blank-p (match-string 2))))
-          (replace-match ""))))
+      (let ((scan (nvemacs--org-scan)))
+        (setq in-file-title (plist-get scan :title)
+              created (plist-get scan :date)
+              fields (plist-get scan :fields)
+              problems (plist-get scan :problems)
+              heading (nvemacs--org-heading))
+        (nvemacs--strip-regions (append (plist-get scan :strip)
+                                        (unless (nvemacs--comments-on)
+                                          (plist-get scan :comments))))))
      ((equal ext "md")
       (let ((fm (nvemacs--md-front-matter)))
         (when fm
           (setq tags (nvemacs--md-tags-in-buffer))
-          (let ((inside (buffer-substring (nth 3 fm) (nth 4 fm)))
-                (toml (eq (car fm) 'toml)))
-            (when (string-match (if toml "^title[ \t]*=[ \t]*\\(.*\\)$" "^title:[ \t]*\\(.*\\)$")
-                                inside)
-              (setq in-file-title (string-trim (match-string 1 inside) "[\"' \t]+" "[\"' \t]+")))
-            (setq created (nvemacs--front-matter-created inside toml)))
+          (let ((scan (nvemacs--md-scan fm)))
+            (setq in-file-title (plist-get scan :title)
+                  created (plist-get scan :date)
+                  fields (plist-get scan :fields)
+                  problems (plist-get scan :problems)))
           (delete-region (nth 1 fm) (nth 2 fm))))
+      (unless (nvemacs--comments-on)
+        (nvemacs--strip-regions (nvemacs--md-comments) " "))
       (setq heading (nvemacs--md-heading))))
-    (setq created (or created (nvemacs--filename-date path)))
+    (setq created (or created (nvemacs--filename-date-parts path)))
     (let* ((first-line (save-excursion
                          (goto-char (point-min))
                          (skip-chars-forward " \t\n")
@@ -647,21 +1003,27 @@ The buffer is modified."
                             (t (cons first-line 'first-line))))))
            (title (nvemacs--store-title (or (car pick) "")))
            (preview (nvemacs--preview ext (cdr pick) title)))
-      ;; A title that is not part of the note's text (filename, front
-      ;; matter) joins the body text, so its words beyond the match part
-      ;; still match as body.
-      (when (and (memq (cdr pick) '(filename front-matter)) (not (string-empty-p title)))
+      ;; A title that is not part of the note's text (filename, keyword,
+      ;; front matter) joins the body text, so its words beyond the match
+      ;; part still match as body.
+      (when (and (memq (cdr pick) '(filename front-matter org-keyword))
+                 (not (string-empty-p title)))
         (goto-char (point-max))
         (insert "\n" title "\n"))
+      (when (and in-file (not (equal in-file title)))   ; the title setting chose another
+        (goto-char (point-max))
+        (insert "\n" in-file "\n"))
       (let ((spelling (nvemacs--filename-spelling path)))
         (when spelling
           (goto-char (point-max))
           (insert "\n" spelling "\n")))
       (nvemacs--fold-buffer)
+      (nvemacs--collapse-whitespace)
       (let ((text (buffer-string)))
         (list title (nvemacs--fold (car (nvemacs--match-title title))) text
               (and (string-match-p nvemacs--cjk-regexp text) t)
-              (nvemacs--tags-clean tags) preview created)))))
+              (nvemacs--tags-clean tags) preview
+              (and created (nvemacs--date-moment created)) created fields problems)))))
 
 (defvar nvemacs--rowid-units-per-second 1
   "Resolution of rowid = modification time.
@@ -715,19 +1077,52 @@ It says what was tried, what that needs and what to do next."
   (format "%s %s.  %s." command expectation solution))
 
 (defun nvemacs--command-error (command expectation solution)
-  "Signal a `user-error' that reads COMMAND EXPECTATION.  SOLUTION."
-  (user-error "%s" (nvemacs--command-text command expectation solution)))
+  "Signal a `user-error' that reads COMMAND EXPECTATION.  SOLUTION.
+A short path in it goes to *Messages* in full first."
+  (let* ((text (nvemacs--command-text command expectation solution))
+         (full (nvemacs--full-paths text)))
+    (unless (equal full text)
+      (let ((inhibit-message t)) (message "%s" full)))
+    (user-error "%s" (substring-no-properties text))))
+
+(defun nvemacs--command-message (command expectation solution)
+  "Show COMMAND EXPECTATION.  SOLUTION, without stopping anything.
+The echo area gets a short path as it is, and *Messages* gets it in full."
+  (let* ((text (nvemacs--command-text command expectation solution))
+         (full (nvemacs--full-paths text)))
+    (if (equal full text)
+        (message "%s" full)
+      (let ((inhibit-message t)) (message "%s" full))
+      (let ((message-log-max nil)) (message "%s" (substring-no-properties text))))))
 
 (defconst nvemacs--path-tail-length 20
-  "How many characters of a path a background error shows, from its end.")
+  "How many characters of a file's folder a message shows, from its end.")
 
 (defun nvemacs--short-path (path)
-  "Return PATH for an error message: its filename, then the end of the path.
-A full path can push the rest of the message out of the echo area."
-  (format "%s <%s>" (file-name-nondirectory path)
-          (if (<= (length path) nvemacs--path-tail-length)
-              path
-            (concat "..." (substring path (- nvemacs--path-tail-length))))))
+  "Return PATH for a message: its filename, then the end of its folder.
+A full path can push the rest of the message out of the echo area.  The
+text remembers PATH, for `nvemacs--full-paths'.  A bare name stays as it is."
+  (let ((folder (file-name-directory path)))
+    (propertize
+     (if (null folder)
+         path
+       (format "%s <%s>" (file-name-nondirectory path)
+               (if (<= (length folder) nvemacs--path-tail-length)
+                   folder
+                 (concat "..." (substring folder (- nvemacs--path-tail-length))))))
+     'nvemacs-full-path path)))
+
+(defun nvemacs--full-paths (text)
+  "Return TEXT with each `nvemacs--short-path' replaced by its full path."
+  (let ((pos 0) (parts nil))
+    (while (< pos (length text))
+      (let ((next (or (next-single-property-change pos 'nvemacs-full-path text)
+                      (length text))))
+        (push (or (get-text-property pos 'nvemacs-full-path text)
+                  (substring-no-properties text pos next))
+              parts)
+        (setq pos next)))
+    (apply #'concat (nreverse parts))))
 
 (defun nvemacs--error-reason (err)
   "Return the text of ERR without the file names a file error ends with."
@@ -759,13 +1154,22 @@ Without it there is no index, and nvEmacs cannot run."
        nvemacs--db
        (format "CREATE VIRTUAL TABLE IF NOT EXISTS %s USING fts5(x, tokenize='trigram case_sensitive 0', detail=none)" tbl)))
     (sqlite-execute nvemacs--db
-                    "CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY, path TEXT UNIQUE, size INTEGER, mtime INTEGER, title TEXT, other INTEGER, tmtime INTEGER, preview TEXT, created INTEGER, cguess INTEGER, added INTEGER, title_key TEXT, tags_key TEXT)")
+                    "CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY, path TEXT UNIQUE, size INTEGER, mtime INTEGER, title TEXT, other INTEGER, tmtime INTEGER, preview TEXT, created INTEGER, cguess INTEGER, added INTEGER, title_key TEXT, tags_key TEXT, cwall INTEGER, coff INTEGER)")
     ;; Tags: FOLDED is the tag through `nvemacs--fold' (search is
     ;; case-insensitive); TAG keeps the spelling for display; KIND file|section.
     (sqlite-execute nvemacs--db
                     "CREATE TABLE IF NOT EXISTS tags (id INTEGER, tag TEXT, folded TEXT, kind TEXT)")
     (sqlite-execute nvemacs--db "CREATE INDEX IF NOT EXISTS tags_folded ON tags(folded)")
     (sqlite-execute nvemacs--db "CREATE INDEX IF NOT EXISTS tags_id ON tags(id)")
+    ;; Fields: KEY as spelled, FKEY and FOLDED for search.  A header comment
+    ;; has no key.  KIND is header, body or comment.
+    (sqlite-execute nvemacs--db
+                    "CREATE TABLE IF NOT EXISTS fields (id INTEGER, key TEXT, fkey TEXT, value TEXT, folded TEXT, kind TEXT, pos INTEGER)")
+    (sqlite-execute nvemacs--db "CREATE INDEX IF NOT EXISTS fields_fkey ON fields(fkey)")
+    (sqlite-execute nvemacs--db "CREATE INDEX IF NOT EXISTS fields_id ON fields(id)")
+    (sqlite-execute nvemacs--db
+                    "CREATE TABLE IF NOT EXISTS problems (id INTEGER, kind TEXT, line INTEGER, detail TEXT)")
+    (sqlite-execute nvemacs--db "CREATE INDEX IF NOT EXISTS problems_id ON problems(id)")
     (sqlite-execute nvemacs--db
                     "CREATE TABLE IF NOT EXISTS info (key TEXT PRIMARY KEY, value)")
     (sqlite-execute nvemacs--db
@@ -787,6 +1191,8 @@ A list or cache drawn for an older generation is stale."
   (dolist (tbl nvemacs--tables)
     (sqlite-execute db (format "DELETE FROM %s WHERE rowid = ?" tbl) (list id)))
   (sqlite-execute db "DELETE FROM tags WHERE id = ?" (list id))
+  (sqlite-execute db "DELETE FROM fields WHERE id = ?" (list id))
+  (sqlite-execute db "DELETE FROM problems WHERE id = ?" (list id))
   (sqlite-execute db "DELETE FROM meta WHERE id = ?" (list id)))
 
 ;; Raw bytes left by decoding invalid UTF-8 (Emacs keeps them as the
@@ -825,6 +1231,27 @@ or not UTF-8."
         (setf (nth 4 rec) (nvemacs--tags-clean (nvemacs--sister-tags path))))
       rec)))
 
+(defun nvemacs--insert-fields (db id fields)
+  "Store FIELDS of note ID in DB.
+They are folded in one pass and written in one statement: a typical
+header has a dozen keys, and one of each per note would slow a rebuild."
+  (when fields
+    (let* ((clean (lambda (s) (subst-char-in-string ?\n ?\s (or s ""))))
+           (folded (split-string
+                    (nvemacs--fold
+                     (mapconcat (lambda (f) (concat (funcall clean (car f)) "\n"
+                                                    (funcall clean (nth 1 f))))
+                                fields "\n"))
+                    "\n"))
+           (args nil))
+      (dolist (f fields)
+        (let ((fkey (pop folded)) (fval (pop folded)))
+          (setq args (nconc args (list id (car f) (and (car f) fkey)
+                                       (nth 1 f) fval (nth 2 f) (nth 3 f))))))
+      (sqlite-execute db (concat "INSERT INTO fields VALUES "
+                                 (mapconcat (lambda (_) "(?,?,?,?,?,?,?)") fields ","))
+                      args))))
+
 (defun nvemacs--insert-note (db path attrs rec)
   "Insert record REC of PATH (file ATTRS) into DB under rowid = mtime.
 Every note gets an Added date (`nvemacs--added-date').  Its Created date
@@ -834,19 +1261,23 @@ collation."
   (let ((id (nvemacs--mtime-us attrs)))
     (while (sqlite-select db "SELECT 1 FROM meta WHERE id = ?" (list id))
       (setq id (1+ id)))                          ; collision: nudge by 1
-    (pcase-let* ((`(,title ,ftitle ,ftext ,other ,tags ,preview ,declared) rec)
+    (pcase-let* ((`(,title ,ftitle ,ftext ,other ,tags ,preview ,declared ,parts ,fields ,problems) rec)
                  (added (nvemacs--added-date path attrs))
                  (folded (mapcar (lambda (tk) (nvemacs--fold (car tk))) tags)))
-      (sqlite-execute db "INSERT INTO meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+      (sqlite-execute db "INSERT INTO meta VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                       (list id path (file-attribute-size attrs)
                             (nvemacs--mtime-us attrs) title (if other 1 0)
                             (nvemacs--sister-mtime path)
                             preview (or declared added) (if declared 0 1)
                             added (nvemacs--fold (or title ""))
-                            (nvemacs--tags-key folded)))
+                            (nvemacs--tags-key folded) (car parts) (cdr parts)))
       (cl-loop for tk in tags for f in folded
                do (sqlite-execute db "INSERT INTO tags VALUES (?,?,?,?)"
                                   (list id (car tk) f (symbol-name (cdr tk)))))
+      (nvemacs--insert-fields db id fields)
+      (dolist (pb problems)
+        (sqlite-execute db "INSERT INTO problems VALUES (?,?,?,?)"
+                        (list id (symbol-name (car pb)) (nth 1 pb) (nth 2 pb))))
       (sqlite-execute db "INSERT INTO body(rowid, x) VALUES (?,?)" (list id ftext))
       (sqlite-execute db "INSERT INTO title(rowid, x) VALUES (?,?)" (list id ftitle))
       (when other
@@ -955,11 +1386,11 @@ Where both have a key, the earlier date is kept."
                     (when (or (null old) (< (cadr e) old)) (puthash (car e) (cadr e) table))))))
           (end-of-file nil)
           (invalid-read-syntax
-           (message "%s" (nvemacs--command-text
-                          "The Added-dates file"
-                          (format "requires valid entries, and %s is damaged at line %d"
-                                  (nvemacs--short-path f) (line-number-at-pos))
-                          "Repair or restore that file")))))))
+           (nvemacs--command-message
+            "The Added-dates file"
+            (format "requires valid entries, and %s is damaged at line %d"
+                    (nvemacs--short-path f) (line-number-at-pos))
+            "Repair or restore that file"))))))
   table)
 
 (defun nvemacs--dates-table ()
@@ -1058,7 +1489,7 @@ Signals `nvemacs-skip' before writing anything."
 
 ;;;; Index version
 
-(defconst nvemacs--index-version 8
+(defconst nvemacs--index-version 9
   "Format version of the index.
 Bump it whenever the schema, folding, import filters or rowid unit
 change: `nvemacs' rebuilds an index with another version, because a
@@ -1072,7 +1503,10 @@ stale one gives wrong results without any error.
     meta.cguess, info.match_width;
 7 = a filename with `_' also in the body as spelled
     (`nvemacs--filename-spelling');
-8 = meta.added, and the sort keys meta.title_key and meta.tags_key.")
+8 = meta.added, and the sort keys meta.title_key and meta.tags_key;
+9 = meta.cwall and meta.coff, the Created date as written; the fields and
+    problems tables; whitespace runs in the body indexed as one space;
+    keys and comments out of the body.")
 
 (defun nvemacs--index-current-p ()
   "Non-nil if the index was built with `nvemacs--index-version'."
@@ -1120,7 +1554,8 @@ SISTERS (NOTE-PATH . MTIME-US) of its `.tags' sister files."
                      (not (string-match-p nvemacs-ignore-dir-regexp name)))
             (push (file-name-as-directory (car entry)) subdirs)))
          ((and (null (file-attribute-type attrs)) (string-match-p ext-re name))
-          (push entry notes))
+          (unless (nvemacs--malformed-path-p (car entry))
+            (push entry notes)))
          ((and (null (file-attribute-type attrs)) (string-suffix-p ".tags" name))
           (push (cons (substring (car entry) 0 -5) (nvemacs--mtime-us attrs)) sisters)))))
     (list notes (nreverse subdirs) sisters)))
@@ -1144,13 +1579,15 @@ Also sets `nvemacs--listed-dirs' and `nvemacs--listed-sisters'."
 (defun nvemacs-index-rebuild ()
   "Delete the index and build it from every note."
   (interactive)
+  (nvemacs--comments-restore)
   (when nvemacs--db (sqlite-close nvemacs--db) (setq nvemacs--db nil))
   (when (file-exists-p (nvemacs--index-path)) (delete-file (nvemacs--index-path)))
   (let* ((db (nvemacs--db))
          (files (nvemacs--note-files))
          (nvemacs--births (nvemacs--birth-times (mapcar #'car files)))
          (n 0))
-    (setq nvemacs--skipped nil)
+    (setq nvemacs--skipped nil
+          nvemacs--comments-held nil)
     (nvemacs--with-transaction db
       (dolist (f files)
         (condition-case err
@@ -1162,6 +1599,8 @@ Also sets `nvemacs--listed-dirs' and `nvemacs--listed-sisters'."
                       (list nvemacs--index-version))
       (sqlite-execute db "INSERT OR REPLACE INTO info VALUES ('match_width', ?)"
                       (list nvemacs-title-match-width))
+      (sqlite-execute db "INSERT OR REPLACE INTO info VALUES ('search_comments', ?)"
+                      (list (if nvemacs-search-comments 1 0)))
       (sqlite-execute db "INSERT OR REPLACE INTO info VALUES ('rebuilt', ?)"
                       (list (format-time-string "%F %R")))
       (nvemacs--bump-generation db))
@@ -1171,6 +1610,7 @@ Also sets `nvemacs--listed-dirs' and `nvemacs--listed-sisters'."
     ;; Reclaim the pages 'optimize' frees: without it the file was 3.3x the
     ;; text at 100 MB instead of ~1.6x (measured 2026-11-18).
     (sqlite-execute db "VACUUM")
+    (nvemacs--malformed-save)
     (message "nvEmacs: indexed %d notes%s" n (nvemacs--skip-summary))
     n))
 
@@ -1303,6 +1743,7 @@ Background syncs use the same steps in idle slices."
           ('new (cl-incf new)) ('changed (cl-incf changed)) ('deleted (cl-incf deleted))))
       (when (> (+ new changed deleted) 0) (nvemacs--bump-generation db)))
     (nvemacs--dates-flush)
+    (when (> (+ new changed deleted) 0) (nvemacs--malformed-save))
     (list new changed deleted)))
 
 (defun nvemacs--ensure-match-width ()
@@ -1326,6 +1767,34 @@ of the two widths can differ (a title is at most 2 columns per char)."
                 (sqlite-execute db (format "INSERT INTO %s(rowid, x) VALUES (?,?)" tbl) (list (car r) f)))))
           (sqlite-execute db "INSERT OR REPLACE INTO info VALUES ('match_width', ?)" (list new))
           (when rows (nvemacs--bump-generation db)))))))
+
+(defun nvemacs--comments-indexed-p ()
+  "Non-nil if the index was built with comments in plain search."
+  (eql 1 (caar (sqlite-select (nvemacs--db)
+                              "SELECT value FROM info WHERE key = 'search_comments'"))))
+
+(defun nvemacs--comments-restore ()
+  "Apply the choice `nvemacs-index-comments' saved in state.eld, if any."
+  (pcase (alist-get 'search-comments (nvemacs--state-read))
+    ('on (setq nvemacs-search-comments t))
+    ('off (setq nvemacs-search-comments nil))))
+
+(defun nvemacs--comments-check ()
+  "Offer a rebuild if `nvemacs-search-comments' differs from the index.
+Comments are in the index or not, so only a rebuild can change that.
+Without one the index keeps what it holds, and notes indexed later
+follow it, so a search never sees half of them each way."
+  (let ((indexed (nvemacs--comments-indexed-p)))
+    (cond
+     ((eq indexed (and nvemacs-search-comments t)) (setq nvemacs--comments-held nil))
+     ((and (not noninteractive)
+           (y-or-n-p (format "nvemacs-search-comments is now %s.  Rebuild the index to apply it? "
+                             (if nvemacs-search-comments "on" "off"))))
+      (nvemacs-index-rebuild))
+     (t
+      (setq nvemacs--comments-held (list indexed))
+      (message "nvEmacs: comments stay %s until M-x nvemacs-index-rebuild"
+               (if indexed "searched" "unsearched"))))))
 
 ;;;; Background sync and auto-save
 ;; Defined with the search window below.
@@ -1472,13 +1941,13 @@ A logging failure is reported and never stops nvEmacs."
             (delete-region (point) (progn (forward-line 1) (point))))
           (nvemacs--write-file file)))
     (error
-     (message "%s" (nvemacs--command-text
-                    (format "The %s log" kind)
-                    (format "requires a writable data folder, and %s could not be written: %s"
-                            (nvemacs--short-path
-                             (expand-file-name (concat kind ".jsonl") (nvemacs--log-directory)))
-                            (nvemacs--error-reason err))
-                    "Check the permissions of nvemacs-data-directory")))))
+     (nvemacs--command-message
+      (format "The %s log" kind)
+      (format "requires a writable data folder, and %s could not be written: %s"
+              (nvemacs--short-path
+               (expand-file-name (concat kind ".jsonl") (nvemacs--log-directory)))
+              (nvemacs--error-reason err))
+      "Check the permissions of nvemacs-data-directory"))))
 
 (defun nvemacs--note-first-row ()
   "Called after rows are inserted: time the first row of a measured start."
@@ -1565,7 +2034,9 @@ fill the log)."
     (when r
       (setq r (plist-put r :wall-ms (nvemacs--ms (plist-get r :t0))))
       (setq nvemacs--last-sync (plist-put r :when (format-time-string "%F %T")))
-      (when (eq (plist-get r :trigger) 'startup) (nvemacs--homepage-checked r))
+      (when (eq (plist-get r :trigger) 'startup)
+        (nvemacs--malformed-save)
+        (nvemacs--homepage-checked r))
       (when (and nvemacs-instrumentation
                  (or (eq (plist-get r :trigger) 'startup) (> (plist-get r :items) 0)))
         (nvemacs--log
@@ -1760,11 +2231,16 @@ effect here."
   (add-function :after after-focus-change-function #'nvemacs--focus-changed)
   (unless (and nvemacs--auto-save-timer (eql nvemacs--auto-save-armed nvemacs-auto-save-interval))
     (nvemacs--auto-save-arm))
+  (add-hook 'pre-redisplay-functions #'nvemacs--pin-sync)
   (nvemacs--note-files)                     ; sets `nvemacs--listed-dirs'
   (nvemacs--update-watches))
 
 (defun nvemacs--sync-disable ()
   "Stop watches, timers, the focus trigger and auto-save."
+  (remove-hook 'pre-redisplay-functions #'nvemacs--pin-sync)
+  (walk-windows (lambda (w) (when (nvemacs--pinned-p w)
+                              (set-window-parameter w 'header-line-format nil)))
+                'nomini t)
   (dolist (w nvemacs--watches) (ignore-errors (file-notify-rm-watch (cdr w))))
   (setq nvemacs--watches nil nvemacs--sync-queue nil nvemacs--plan nil nvemacs--sync-changes nil
         nvemacs--sync-run nil)            ; the next start must not join it
@@ -1781,9 +2257,30 @@ effect here."
 
 ;;;; Search core, no UI
 
-(defun nvemacs--query-terms (query)
-  "Fold QUERY and split it into terms."
-  (split-string (nvemacs--fold query) "[ \t\n]+" t))
+(defun nvemacs--query-tokens (query)
+  "Fold QUERY and split it into tokens, (TEXT . QUOTE-AT).
+Spaces separate tokens, except inside double quotes, where each run is
+one space.  QUOTE-AT is where in TEXT the quoted part starts, or nil.  A
+quote opens only at the start of a token, after a `-', or after a colon,
+so 12\" is plain text.  An unclosed quote runs to the end, so results
+narrow while a phrase is being typed."
+  (let ((tok nil) (at nil) (in nil) (out nil))
+    (cl-flet ((finish ()
+                (when tok (push (cons (apply #'string (reverse tok)) at) out))
+                (setq tok nil at nil)))
+      (seq-doseq (c (nvemacs--fold query))
+        (cond
+         ((and (eq c ?\") in) (setq in nil))
+         ((and (eq c ?\") (not at)
+               (or (null tok) (eq (car tok) ?:) (equal tok '(?-))))
+          (setq in t at (length tok)))
+         ((memq c '(?\s ?\t ?\n))
+          (if in
+              (unless (eq (car tok) ?\s) (push ?\s tok))
+            (finish)))
+         (t (push c tok))))
+      (finish))
+    (nreverse out)))
 
 (defun nvemacs--route (terms)
   "Return (TITLE-TABLE . BODY-TABLE) for TERMS."
@@ -1817,42 +2314,226 @@ nothing."
              (push term args))))
     (cons (mapconcat #'identity (nreverse sql) " AND ") (nreverse args))))
 
+(defconst nvemacs--date-min -62135596800 "An open start of a date range: year 1.")
+(defconst nvemacs--date-max 253402300799 "An open end of a date range: year 9999.")
+
+(defun nvemacs--wall (y mo d h mi sec)
+  "Return Y-MO-D H:MI:SEC in seconds, as if UTC."
+  (time-convert (encode-time (list sec mi h d mo y nil nil 0)) 'integer))
+
+(defun nvemacs--date-anchor (s)
+  "Read S, a date in a search, as (LO HI PRECISION), or nil.
+A partial date means its whole span: 2026, 2026-11, 2026-11-23.  With a
+time, it means that minute or second.  LO and HI are clock times in
+seconds (`nvemacs--date-parts').  PRECISION is `year', `month' or `day'."
+  (let ((case-fold-search t))
+    (cond
+     ((string-match "\\`\\([0-9]\\{4\\}\\)\\'" s)
+      (let ((y (string-to-number (match-string 1 s))))
+        (list (nvemacs--wall y 1 1 0 0 0) (nvemacs--wall y 12 31 23 59 59) 'year)))
+     ((string-match "\\`\\([0-9]\\{4\\}\\)-\\([0-9]\\{2\\}\\)\\'" s)
+      (let ((y (string-to-number (match-string 1 s)))
+            (mo (string-to-number (match-string 2 s))))
+        (when (<= 1 mo 12)
+          (list (nvemacs--wall y mo 1 0 0 0)
+                (nvemacs--wall y mo (date-days-in-month y mo) 23 59 59) 'month))))
+     ((string-match-p "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\'" s)
+      (let ((p (nvemacs--date-parts s)))
+        (when p (list (car p) (+ (car p) 86399) 'day))))
+     ((string-match-p (concat "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}[-t ]"
+                              "[0-9]\\{1,2\\}:[0-9]\\{2\\}\\(?::[0-9]\\{2\\}\\)?\\'")
+                      s)
+      (let ((p (nvemacs--date-parts (upcase s))))
+        (when p
+          (list (car p) (+ (car p) (if (= (length (split-string s ":")) 3) 0 59)) 'day)))))))
+
+(defun nvemacs--wall-add (wall n unit end-of-month)
+  "Return clock time WALL moved by N of UNIT: ?d, ?w, ?m or ?y.
+A month step stops at the end of a shorter month.  END-OF-MONTH keeps
+the result on the last day, for the end of a whole month or year."
+  (if (memq unit '(?d ?w))
+      (+ wall (* n (if (eq unit ?w) 7 1) 86400))
+    (pcase-let* ((`(,sec ,mi ,h ,d ,mo ,y) (decode-time wall 0))
+                 (total (+ (* y 12) (1- mo) (* n (if (eq unit ?y) 12 1))))
+                 (ny (floor total 12))
+                 (nm (1+ (mod total 12)))
+                 (last (date-days-in-month ny nm)))
+      (nvemacs--wall ny nm (if end-of-month last (min d last)) h mi sec))))
+
+(defun nvemacs--date-range (v)
+  "Read V, the text after `created:' and the like, as (LO . HI), or nil.
+Both ends are included and clock times; nil for an end means open.
+Forms: 2026-11, A..B, >=A, >A, <=A, <A, -30d (the last 30 days), A~1m
+\(either side of A), A>1m (forward from A) and A<1m (back from A).  A
+number with no unit takes A's precision: years, months or days."
+  (cond
+   ((string-match "\\`-\\([0-9]+\\)\\([dwmy]\\)\\'" v)
+    (let ((n (string-to-number (match-string 1 v)))
+          (unit (aref (match-string 2 v) 0))
+          (today (nvemacs--date-anchor (format-time-string "%F"))))
+      (cons (nvemacs--wall-add (car today) (- n) unit nil) (nth 1 today))))
+   ((string-match "\\`\\(.+\\)\\.\\.\\(.+\\)\\'" v)
+    ;; The strings first: reading a date resets the match data.
+    (let* ((from (match-string 1 v)) (to (match-string 2 v))
+           (a (nvemacs--date-anchor from))
+           (b (nvemacs--date-anchor to)))
+      (when (and a b)
+        (cons (min (car a) (car b)) (max (nth 1 a) (nth 1 b))))))
+   ((string-match "\\`\\(>=\\|<=\\|>\\|<\\)\\(.+\\)\\'" v)
+    (let* ((op (match-string 1 v)) (a (nvemacs--date-anchor (match-string 2 v))))
+      (when a
+        (pcase op
+          (">=" (cons (car a) nil))
+          (">" (cons (1+ (nth 1 a)) nil))
+          ("<=" (cons nil (nth 1 a)))
+          (_ (cons nil (1- (car a))))))))
+   ((string-match "\\`\\(.+?\\)\\([~<>]\\)\\([0-9]+\\)\\([dwmy]?\\)\\'" v)
+    (let* ((from (match-string 1 v))
+           (op (aref (match-string 2 v) 0))
+           (n (string-to-number (match-string 3 v)))
+           (given (match-string 4 v))
+           (a (nvemacs--date-anchor from)))
+      (when a
+        (let* ((unit (if (string-empty-p given)
+                         (pcase (nth 2 a) ('year ?y) ('month ?m) (_ ?d))
+                       (aref given 0)))
+               (whole (and (memq unit '(?m ?y)) (memq (nth 2 a) '(year month)) t)))
+          (cons (if (eq op ?>) (car a) (nvemacs--wall-add (car a) (- n) unit nil))
+                (if (eq op ?<) (nth 1 a) (nvemacs--wall-add (nth 1 a) n unit whole)))))))
+   (t (let ((a (nvemacs--date-anchor v)))
+        (and a (cons (car a) (nth 1 a)))))))
+
+(defvar nvemacs--query-bad nil
+  "The first date search of the last parsed query that could not be read.")
+
+(defun nvemacs--query-item (kind v)
+  "Return the filter for prefix KIND and value V, or nil while V is empty.
+A tag is a string.  Any other filter is (KIND TEXT A B): TEXT as typed;
+A and B the value or the two ends of a date range.  (bad TEXT) is a
+date that cannot be read."
+  (let ((text (format "%s:%s" kind v)))
+    (pcase kind
+      ('tag
+       ;; Not `nvemacs--tag-normalize': a trailing `_' being typed
+       ;; (`tag:alpha_') must narrow the list, not be trimmed.
+       (let ((tg (replace-regexp-in-string
+                  "\\`_+" "" (nvemacs--underscore v nvemacs--tag-chars))))
+         (when (string-match-p "[^_]" tg) (nvemacs--fold tg))))
+      ((or 'key 'meta) (unless (string-empty-p v) (list kind text v)))
+      (_ (unless (string-empty-p v)
+           (let ((r (nvemacs--date-range v)))
+             (if r (list kind text (car r) (cdr r)) (list 'bad text))))))))
+
 (defun nvemacs--parse-query (query)
   "Split QUERY into (TERMS INCLUDE EXCLUDE).
-TERMS are the text terms; INCLUDE and EXCLUDE are the tags of `tag:x'
-and `-tag:x', normalised and folded.  A bare `tag:' is ignored while it
-is being typed."
+TERMS are the text terms, a quoted phrase being one term.  INCLUDE and
+EXCLUDE are the filters of the prefixes `tag:', `key:', `meta:',
+`created:', `added:' and `modified:', and of the same with `-' (see
+`nvemacs--query-item').  EXCLUDE also holds negated words, (word TEXT
+WORD).  A bare prefix or a lone `-' is ignored while it is being typed.
+Any other colon, and anything quoted, is plain text."
   (let (terms inc exc)
-    (dolist (tok (nvemacs--query-terms query))
-      (if (string-match "\\`\\(-?\\)tag:\\(.*\\)\\'" tok)
-          (let* ((neg (equal (match-string 1 tok) "-"))
-                 ;; Not `nvemacs--tag-normalize': a trailing `_' being typed
-                 ;; (`tag:alpha_') must narrow the list, not be trimmed.
-                 (v (replace-regexp-in-string
-                     "\\`_+" "" (nvemacs--underscore (match-string 2 tok) nvemacs--tag-chars))))
-            (when (string-match-p "[^_]" v)
-              (if neg (push (nvemacs--fold v) exc) (push (nvemacs--fold v) inc))))
-        (push tok terms)))
+    (setq nvemacs--query-bad nil)
+    (dolist (tk (nvemacs--query-tokens query))
+      (let ((tok (car tk)) (at (cdr tk)))
+        (if (and (string-match "\\`\\(-?\\)\\(tag\\|key\\|meta\\|created\\|added\\|modified\\):\\(.*\\)\\'" tok)
+                 (or (null at) (>= at (1+ (match-end 2)))))
+            (let* ((neg (equal (match-string 1 tok) "-"))
+                   (kind (intern (match-string 2 tok)))
+                   (item (nvemacs--query-item kind (match-string 3 tok))))
+              (when item
+                (when (and (eq (car-safe item) 'bad) (not nvemacs--query-bad))
+                  (setq nvemacs--query-bad (nth 1 item)))
+                (if neg (push item exc) (push item inc))))
+          ;; `-whale' and `-"blue whale"' leave notes out.  In quotes the
+          ;; minus is text, and so it is before anything but a letter, digit
+          ;; or quote: --verbose, ->.  A lone `-' is still being typed.
+          (cond
+           ((or (not (string-prefix-p "-" tok)) (eql at 0)) (push tok terms))
+           ((= (length tok) 1))
+           ((or (eql at 1) (string-match-p "\\`-[[:alnum:]]" tok))
+            (let ((word (substring tok 1)))
+              (push (list 'word (if at (format "\"%s\"" word) word) word) exc)))
+           (t (push tok terms))))))
     (list (nreverse terms) (nreverse inc) (nreverse exc))))
 
-(defun nvemacs--tag-filter (inc exc)
-  "Return (FRAGMENT . ARGS), SQL that restricts `rowid' by tags.
-The notes kept have a tag that STARTS WITH each of INC and none
-starting with any of EXC (a prefix, so the list narrows while a tag is
-typed).  FRAGMENT is empty or begins with \" AND\"."
-  (let ((frag "") (args nil))
-    (dolist (v inc)
-      (setq frag (concat frag " AND rowid IN (SELECT id FROM tags WHERE substr(folded, 1, ?) = ?)")
-            args (append args (list (length v) v))))
-    (dolist (v exc)
-      (setq frag (concat frag " AND rowid NOT IN (SELECT id FROM tags WHERE substr(folded, 1, ?) = ?)")
-            args (append args (list (length v) v))))
-    (cons frag args)))
+(defun nvemacs--filter-text (item)
+  "Return search filter ITEM as the user typed it."
+  (if (stringp item) (concat "tag:" item) (nth 1 item)))
+
+(defun nvemacs--filter-parts (item)
+  "Return (TABLE COLUMNS CONDITION . ARGS) for filter ITEM, not a tag."
+  (pcase item
+    (`(key ,_ ,v)
+     ;; The highest character ends every name starting with V.
+     `("fields" "fkey" "fkey >= ? AND fkey <= ?" ,v ,(concat v (string #x10FFFF))))
+    (`(meta ,_ ,v) `("fields" "folded" "instr(folded, ?) > 0" ,v))
+    (`(,kind ,_ ,lo ,hi)
+     (let ((mlo (if lo (nvemacs--date-moment (cons lo nil)) nvemacs--date-min))
+           (mhi (if hi (nvemacs--date-moment (cons hi nil)) nvemacs--date-max))
+           (wlo (or lo nvemacs--date-min))
+           (whi (or hi nvemacs--date-max)))
+       (pcase kind
+         ;; As written when the note gives a date; a guess is a real moment.
+         ('created
+          `("meta" "created, cwall"
+            "CASE WHEN cwall IS NULL THEN created BETWEEN ? AND ? ELSE cwall BETWEEN ? AND ? END"
+            ,mlo ,mhi ,wlo ,whi))
+         ('added `("meta" "added" "added BETWEEN ? AND ?" ,mlo ,mhi))
+         (_ `("meta" "mtime" "mtime BETWEEN ? AND ?" ,mlo ,mhi)))))))
+
+(defun nvemacs--tag-filter (inc exc &optional per-row)
+  "Return (FRAGMENT . ARGS), SQL that restricts `rowid' by the filters.
+The notes kept match every filter of INC and none of EXC.  Tags and keys
+match by the start of the name, so the list narrows while one is typed.
+A date that cannot be read matches nothing.  FRAGMENT is empty or begins
+with \" AND\".
+
+PER-ROW non-nil, for a search with words or a check of one note: each
+row looks up its own note, since words read the notes in slices and an
+id list would be rebuilt for each (`whale meta:x' took 3.4 s on 42,460
+notes, measured 2026-11-23).  Otherwise one id list is read: a rare
+`key:' stays at milliseconds where a lookup per note took 470 ms.  The
+inner SELECT renames `id' so that `rowid' is the outer query's row."
+  (if (cl-some (lambda (i) (eq (car-safe i) 'bad)) (append inc exc))
+      (cons " AND 0" nil)
+    (let ((frag "") (args nil))
+      (dolist (group `((nil . ,inc) (t . ,exc)))
+        (dolist (item (cdr group))
+          (let ((neg (car group)))
+            (cond
+             ((stringp item)
+                (setq frag (concat frag (format " AND rowid %s (SELECT id FROM tags WHERE substr(folded, 1, ?) = ?)"
+                                                (if neg "NOT IN" "IN")))
+                      args (append args (list (length item) item))))
+             ((eq (car item) 'word)
+              ;; The body holds the full title too.  Text is folded, so
+              ;; `instr' is an exact match.
+              (let ((table (cdr (nvemacs--route (list (nth 2 item))))))
+                (if per-row
+                    (setq frag (concat frag (format " AND NOT EXISTS (SELECT 1 FROM (SELECT rowid AS note, x AS doc FROM %s) WHERE note = rowid AND instr(doc, ?) > 0)"
+                                                    table))
+                          args (append args (list (nth 2 item))))
+                  (let ((match (nvemacs--term-where (list (nth 2 item)))))
+                    (setq frag (concat frag (format " AND rowid NOT IN (SELECT rowid FROM %s WHERE %s)"
+                                                    table (car match)))
+                          args (append args (cdr match)))))))
+             (t
+              (pcase-let ((`(,table ,cols ,cond . ,vals) (nvemacs--filter-parts item)))
+                (setq frag (concat
+                            frag
+                            (if per-row
+                                (format " AND %sEXISTS (SELECT 1 FROM (SELECT id AS note, %s FROM %s) WHERE note = rowid AND %s)"
+                                        (if neg "NOT " "") cols table cond)
+                              (format " AND rowid %s (SELECT id FROM %s WHERE %s)"
+                                      (if neg "NOT IN" "IN") table cond)))
+                      args (append args vals))))))))
+      (cons frag args))))
 
 (defun nvemacs--search-all (query)
   "Every rowid matching QUERY, newest first.  Reference path for tests."
   (pcase-let* ((`(,terms ,inc ,exc) (nvemacs--parse-query query))
-               (filter (nvemacs--tag-filter inc exc)))
+               (filter (nvemacs--tag-filter inc exc terms)))
     (cond
      (terms
       (let ((match (nvemacs--term-where terms)))
@@ -1871,6 +2552,7 @@ typed).  FRAGMENT is empty or begins with \" AND\"."
 (defun nvemacs--watched-note-p (path)
   "Non-nil if PATH is a note inside a watched directory."
   (and path
+       (not (nvemacs--malformed-path-p path))
        (member (downcase (or (file-name-extension path) "")) nvemacs-import-extensions)
        (cl-some (lambda (d) (file-in-directory-p path (expand-file-name d)))
                 nvemacs-watched-directories)))
@@ -1900,12 +2582,12 @@ typing).  WAS is the path the note had, if it has just been moved."
         (nvemacs-skip
          (push (cons path (cadr err)) nvemacs--skipped)
          (when was (nvemacs--forget was))
-         (message "%s" (nvemacs--command-text
-                        "The search index"
-                        (format "requires a readable note, and %s was saved but not indexed: %s"
-                                (nvemacs--short-path path)
-                                (string-replace path (file-name-nondirectory path) (cadr err)))
-                        "Fix the note, or see M-x nvemacs-index-skipped")))))))
+         (nvemacs--command-message
+          "The search index"
+          (format "requires a readable note, and %s was saved but not indexed: %s"
+                  (nvemacs--short-path path)
+                  (string-replace path (file-name-nondirectory path) (cadr err)))
+          "Fix the note, or see M-x nvemacs-index-skipped"))))))
 
 (defun nvemacs--forget (path)
   "PATH is gone (moved to the Trash by nvEmacs): drop its index entry and row."
@@ -1994,7 +2676,8 @@ restores the search you typed."
     (define-key map (kbd "C-c C-x C-a") #'nvemacs-note-move-outside) ; as Org's archive
     (define-key map (kbd "C-c ^") #'nvemacs-notelist-sort-column)    ; as Org's sort
     (define-key map (kbd "C-c C-x C-c") #'nvemacs-notelist-column-toggle) ; as Org's columns
-    (define-key map [header-line mouse-1] #'nvemacs--heading-click)
+    (define-key map [tab-line mouse-1] #'nvemacs--heading-click)
+    (define-key map [header-line mouse-1] #'nvemacs--pinned-click)
     ;; Mouse: nothing happens on the press; the release selects. See
     ;; `nvemacs-notelist-mouse-select'.
     (define-key map [down-mouse-1] #'ignore)
@@ -2058,9 +2741,13 @@ apart.  That is compared in pixels, since rows with Hangul are taller."
 \\{nvemacs-mode-map}"
   (setq-local truncate-lines t)
   (setq-local buffer-undo-list t)                 ; no undo of redraws
-  ;; The header line holds the column headings
-  ;; (it never scrolls); the status moved to the mode line.
-  (setq-local header-line-format '(:eval (nvemacs--headings)))
+  ;; The tab line holds the column headings (it never scrolls), so the header
+  ;; line under it can pin the search line.  It looks like a header line, and
+  ;; `global-tab-line-mode' must not take it.  The status is in the mode line.
+  (setq-local tab-line-exclude t)
+  (setq-local tab-line-format '(:eval (nvemacs--headings)))
+  (setq-local face-remapping-alist (cons '(tab-line header-line) face-remapping-alist))
+  (add-hook 'window-scroll-functions #'nvemacs--pin-scrolled nil t)
   (setq-local mode-line-format
               '("%e" mode-line-front-space mode-line-buffer-identification "  "
                 (:eval nvemacs--status)))
@@ -2216,6 +2903,68 @@ and with nothing selected nothing is marked."
         (and p (cons p (save-excursion (goto-char p) (line-beginning-position 2)))))
     (cons (line-beginning-position) (line-beginning-position 2))))
 
+;;;; The pinned search line
+;;
+;; The search line is the buffer's first line, so it scrolls with the rows.
+;; While a window has scrolled it off, that window's header line shows a
+;; read-only copy in the same place on screen.  The real line stays the one
+;; that is edited: typing moves point there, and the list comes back to it.
+;; It is a window parameter because two frames can be scrolled differently.
+
+(defconst nvemacs--pin-format '(:eval (nvemacs--pinned-search))
+  "A window's header line while its search line is scrolled off.")
+
+(defun nvemacs--pinned-search ()
+  "Return the search line as header-line text.
+It keeps the line's faces, over the normal text's rather than the
+header line's, and fills the row."
+  (let ((text (string-replace
+               "%" "%%"
+               (buffer-substring (point-min)
+                                 (save-excursion (goto-char nvemacs--query-start)
+                                                 (line-end-position))))))
+    (add-face-text-property 0 (length text) 'default t text)
+    (concat text (propertize " " 'face 'default 'display '(space :align-to right)))))
+
+(defun nvemacs--pinned-p (win)
+  "Return non-nil if WIN's header line holds the pinned search line."
+  (eq (window-parameter win 'header-line-format) nvemacs--pin-format))
+
+(defun nvemacs--pin-wanted-p (win &optional start)
+  "Return non-nil if WIN shows the list from START, past its search line.
+START defaults to the window's start."
+  (let ((list (get-buffer nvemacs--buffer-name)))
+    (and (eq (window-buffer win) list)
+         (let ((rows (buffer-local-value 'nvemacs--rows-start list)))
+           (and rows (>= (or start (window-start win)) rows))))))
+
+(defun nvemacs--pin-sync (win)
+  "Show or hide the pinned search line in WIN, as its scroll position needs.
+A `pre-redisplay-functions' entry while nvEmacs runs.  It is global so
+that the copy also leaves a window that stops showing the list."
+  (let ((want (nvemacs--pin-wanted-p win)))
+    (unless (eq (and want t) (nvemacs--pinned-p win))
+      (set-window-parameter win 'header-line-format (and want nvemacs--pin-format)))))
+
+(defun nvemacs--pin-refresh (win)
+  "Bring WIN's pinned search line up to date and draw it."
+  (when (window-live-p win)
+    (nvemacs--pin-sync win)
+    (force-window-update win)))
+
+(defun nvemacs--pin-scrolled (win start)
+  "Follow a new START that redisplay chose for WIN.
+A buffer-local `window-scroll-functions' entry.  This runs too late to
+change the window being drawn, so the change waits for a timer."
+  (unless (eq (and (nvemacs--pin-wanted-p win start) t) (nvemacs--pinned-p win))
+    (run-at-time 0 nil #'nvemacs--pin-refresh win)))
+
+(defun nvemacs--pinned-click (event)
+  "Go to the search line after a click on its pinned copy in EVENT."
+  (interactive "e")
+  (select-window (posn-window (event-start event)))
+  (nvemacs--focus-query))
+
 (defvar nvemacs--away nil "Non-nil once the cursor left the list for another window.")
 
 (defun nvemacs--selection-changed (win)
@@ -2332,9 +3081,11 @@ An `after-change-functions' entry: BEG is where the change starts."
 (defun nvemacs--window-size (&optional win)
   "Return (WIDTH . HEIGHT), the body size of WIN in columns and lines.
 WIN defaults to the window showing the current buffer.  Return nil if
-there is no such window."
+there is no such window.  The pinned search line's row counts as body:
+it comes and goes with scrolling, which is not a new window size."
   (let ((win (or win (get-buffer-window (current-buffer)))))
-    (and win (cons (window-body-width win) (window-body-height win)))))
+    (and win (cons (window-body-width win)
+                   (+ (window-body-height win) (if (nvemacs--pinned-p win) 1 0))))))
 
 (defun nvemacs--window-resized (win)
   "Search again when the nvEmacs window WIN has a new size.
@@ -2559,9 +3310,10 @@ a grey (untitled)."
 (defun nvemacs--cell (entry _id row)
   "Return the text of column ENTRY for a note whose data is ROW.
 ENTRY is (COLUMN START WIDTH), and ROW is (TITLE MTIME PREVIEW CREATED
-CGUESS TAGS-TEXT ADDED).  Every cell after the first starts at its column by
-:align-to (pixels: fallback CJK fonts draw Hangul narrower than the 2
-columns `string-width' counts)."
+CGUESS TAGS-TEXT ADDED CWALL).  A Created date shows as written (CWALL),
+so it reads the same in any time zone.  Every cell after the first
+starts at its column by :align-to (pixels: fallback CJK fonts draw
+Hangul narrower than the 2 columns `string-width' counts)."
   (pcase-let ((`(,col ,start ,w) entry))
     (concat (if (zerop start) "" (propertize " " 'display `(space :align-to ,start)))
             (pcase col
@@ -2569,7 +3321,10 @@ columns `string-width' counts)."
               ('tags (propertize (nvemacs--fit (or (nth 5 row) "") w) 'face 'nvemacs-tags))
               ('modified (nvemacs--date-text (/ (float (nth 1 row)) nvemacs--rowid-units-per-second)))
               ('created (if (nth 3 row)
-                            (concat (if (eql (nth 4 row) 1) "~" " ") (nvemacs--date-text (nth 3 row)))
+                            (concat (if (eql (nth 4 row) 1) "~" " ")
+                                    (if (nth 7 row)
+                                        (format-time-string "%Y-%m-%d" (nth 7 row) t)
+                                      (nvemacs--date-text (nth 3 row))))
                           ""))
               ('added (if (nth 6 row) (nvemacs--date-text (nth 6 row)) ""))))))
 
@@ -2590,7 +3345,7 @@ columns `string-width' counts)."
               'help-echo "mouse-1: sort by this column; again to reverse"))
 
 (defun nvemacs--headings ()
-  "Return the header line: the column headings.
+  "Return the tab line: the column headings.
 They sit at the column positions of the last draw, with a triangle on
 the sort column."
   (mapconcat (lambda (e)
@@ -2731,7 +3486,7 @@ The width is saved in your Customize file, with
 
 (defun nvemacs--row-data (db ids tags)
   "Return a hash table of the row data of IDS, read from index DB.
-Each entry is ID -> (TITLE MTIME PREVIEW CREATED CGUESS TAGS-TEXT ADDED),
+Each entry is ID -> (TITLE MTIME PREVIEW CREATED CGUESS TAGS-TEXT ADDED CWALL),
 read a batch at a time (two queries per row cost ~65 ms of a 4,783-row
 redraw, measured 2026-11-20).  With TAGS nil, no tags are read.  A
 note's tags are listed file tags first, as `nvemacs--tags-text' does,
@@ -2746,10 +3501,10 @@ makes sense."
       (let* ((chunk (seq-take ids 500))
              (marks (mapconcat (lambda (_) "?") chunk ",")))
         (setq ids (nthcdr 500 ids))
-        (dolist (r (sqlite-select db (format "SELECT id, title, mtime, preview, created, cguess, added FROM meta WHERE id IN (%s)" marks)
+        (dolist (r (sqlite-select db (format "SELECT id, title, mtime, preview, created, cguess, added, cwall FROM meta WHERE id IN (%s)" marks)
                                   chunk))
-          (pcase-let ((`(,id ,title ,mtime ,preview ,created ,cguess ,added) r))
-            (puthash id (list title mtime preview created cguess nil added) h)))
+          (pcase-let ((`(,id ,title ,mtime ,preview ,created ,cguess ,added ,cwall) r))
+            (puthash id (list title mtime preview created cguess nil added cwall) h)))
         (when tags
           (dolist (r (sqlite-select db (format "SELECT id, tag FROM tags WHERE id IN (%s) ORDER BY id, %s" marks tag-order)
                                     chunk))
@@ -2928,7 +3683,7 @@ patched the same way; otherwise it is let go."
                      (wins (get-buffer-window-list buf nil t))
                      (here (nvemacs--row-at (point)))
                      (win-ids (mapcar (lambda (w) (cons w (nvemacs--row-at (window-point w)))) wins))
-                     (moved (nvemacs--rows-apply changes (null terms) (nvemacs--tag-filter inc exc)))
+                     (moved (nvemacs--rows-apply changes (null terms) (nvemacs--tag-filter inc exc t)))
                      (follow (lambda (id) (let ((m (assq id moved))) (if m (cdr m) id))))
                      (go (lambda (id) (and id (nvemacs--row-pos (funcall follow id))))))
           (when nvemacs--selected-id    ; a save gives the note a new id
@@ -2955,6 +3710,9 @@ patched the same way; otherwise it is let go."
   "Show the status text, naming the sort when its column is not on screen."
   (setq nvemacs--status
         (concat nvemacs--status-base
+                (if nvemacs--query-bad
+                    (format " · %s requires a date such as 2026-11-23" nvemacs--query-bad)
+                  "")
                 (if (assq (car nvemacs--sort) nvemacs--layout)
                     ""
                   (format " · sorted by %s %s" (car nvemacs--sort) (nvemacs--sort-triangle)))))
@@ -2985,7 +3743,7 @@ is pressed."
          (terms (nth 0 parsed))
          (inc (nth 1 parsed))
          (exc (nth 2 parsed))
-         (filter (nvemacs--tag-filter inc exc))
+         (filter (nvemacs--tag-filter inc exc terms))
          (want (nvemacs--screen-rows))
          (before (length nvemacs--shown))
          (t0 (float-time))
@@ -3178,15 +3936,19 @@ behind), patch it like the visible list; otherwise let it go."
 
 (defun nvemacs--landing-status (&optional inc exc)
   "Return the header line of a list without text terms.
-It reads N of TOTAL newest notes, or of the notes matching the tag
+It reads N of TOTAL newest notes, or of the notes matching the search
 filters INC and EXC."
   (let ((filter (nvemacs--tag-filter inc exc)))
     (nvemacs--set-status
      (if (or inc exc)
          (concat " %s of %s notes with "
-                 (mapconcat #'identity (append (mapcar (lambda (v) (concat "tag:" v)) inc)
-                                               (mapcar (lambda (v) (concat "-tag:" v)) exc))
-                            " ")
+                 ;; A filter is user text, and this is a format string.
+                 (string-replace
+                  "%" "%%"
+                  (mapconcat #'identity
+                             (append (mapcar #'nvemacs--filter-text inc)
+                                     (mapcar (lambda (v) (concat "-" (nvemacs--filter-text v))) exc))
+                             " "))
                  " displayed%s")
        (if (equal nvemacs--sort '(modified . desc))
            " %s of %s Newest notes displayed · type to search%s"
@@ -3287,7 +4049,11 @@ chain."
 (defun nvemacs--sort-sql (column)
   "Return the `meta' field that orders COLUMN."
   (pcase column
-    ('title "title_key") ('tags "tags_key") ('created "created") ('added "added") (_ "id")))
+    ('title "title_key") ('tags "tags_key") ('added "added")
+    ;; The true moment when the note gives a zone.  A date without one is
+    ;; local wherever the user is.
+    ('created (format "coalesce(cwall - coff, cwall - %d, created)" (car (current-time-zone))))
+    (_ "id")))
 
 (defun nvemacs--match-pairs (terms filter column &optional titles)
   "Return every note matching TERMS and tag FILTER, as ((ID KEY) ...).
@@ -3403,7 +4169,7 @@ TERMS, INC and EXC are the parsed search.  The rows already drawn stay;
 the others follow them, title matches and then the rest, each newest
 first.  Return non-nil unless a key stopped the read."
   (let* ((status nvemacs--status-base)
-         (filter (nvemacs--tag-filter inc exc))
+         (filter (nvemacs--tag-filter inc exc t))
          (titles (nvemacs--match-pairs terms filter 'modified t))
          (pairs (if (eq titles 'interrupted)
                     titles
@@ -3452,7 +4218,7 @@ pressed meanwhile leaves the old list up, and the search runs again."
                (want (nvemacs--screen-rows))
                (before (length nvemacs--shown))
                (t0 (float-time))
-               (pairs (nvemacs--match-pairs terms (nvemacs--tag-filter inc exc)
+               (pairs (nvemacs--match-pairs terms (nvemacs--tag-filter inc exc terms)
                                             (car nvemacs--sort)))
                (stopped (eq pairs 'interrupted)))
     (if stopped
@@ -3765,6 +4531,18 @@ prefix argument the cursor stays in the list).  `open' acts like
 `rebuild' restores the nvEmacs arrangement of windows; `respect' leaves
 your windows as they are and only shows the list."
   :type '(choice (const rebuild) (const respect)))
+
+(defcustom nvemacs-searchbar-return-shows 'typed
+  "What the search line shows after `nvemacs-searchbar-return'.
+`typed' shows the search you typed.  With nothing typed, the note pane
+clears too, so an empty search line never sits beside a note.
+`typed-or-title' shows the search you typed.  With nothing typed, the
+note stays selected and the search line shows its title.
+`title' keeps the note selected and shows its title, even over a typed
+search, as Notational Velocity does.
+While a title is shown, typing starts a new search and DEL brings back
+the search you typed."
+  :type '(choice (const typed) (const typed-or-title) (const title)))
 
 (defconst nvemacs--placeholder-name "*nvEmacs: no note*")
 (defconst nvemacs--homepage-name "*nvEmacs home*")
@@ -4091,25 +4869,79 @@ again on `nvemacs-searchbar-return' or when the note is killed.  With
         (nvemacs--view-free-set nil)
         (goto-char nvemacs--query-start) (end-of-line)))))
 
+(defun nvemacs--return-typed-empty-p ()
+  "Return non-nil if no search is typed, even with a title on the search line."
+  (with-current-buffer nvemacs--buffer-name
+    (string-empty-p (string-trim (or (nvemacs--search-text) "")))))
+
+(defun nvemacs--return-title-p ()
+  "Return non-nil if a return should keep the note and show its title."
+  (and (get-buffer nvemacs--buffer-name)
+       (pcase nvemacs-searchbar-return-shows
+         ('title t)
+         ('typed-or-title (nvemacs--return-typed-empty-p)))))
+
+(defun nvemacs--path-id (file)
+  "Return the index id of the note FILE, or nil."
+  (caar (sqlite-select (nvemacs--db) "SELECT id FROM meta WHERE path = ?"
+                       (list (nvemacs--canonical-path file)))))
+
+(defvar nvemacs--waiting)               ; defined with the pending edits
+
+(defun nvemacs--return-note ()
+  "Return the id of the note a return comes back from, or nil.
+From the list that is the selected note; from elsewhere, the note in the
+pane or the one that took the frame.  A new note has no id until it is
+written, so its waiting edits are written here rather than after the
+return."
+  (or (and (eq (current-buffer) (get-buffer nvemacs--buffer-name)) (nvemacs--selection))
+      (let* ((nw (nvemacs--note-window))
+             (l1 (nvemacs--fparam 'nvemacs-l1))
+             (b (cond (nw (window-buffer nw)) (l1 (cdr l1))))
+             (file (and (buffer-live-p b) (buffer-file-name b))))
+        (when file
+          (or (nvemacs--path-id file)
+              (when (and nvemacs-auto-save-interval (memq b nvemacs--waiting)
+                         (not (buffer-local-value 'nvemacs--held b)))
+                (nvemacs--commit b)
+                (nvemacs--path-id file)))))))
+
+(defun nvemacs--return-finish (id)
+  "Finish a return as `nvemacs-searchbar-return-shows' says.
+The cursor is on the search line.  ID is the note to go back to, if any:
+on its row the search line shows its title, as on any selected row."
+  (when (nvemacs--list-window)
+    (with-current-buffer nvemacs--buffer-name
+      (cond
+       (id (nvemacs--show-id id)
+           (when (eql (nvemacs--row-id) id) (setq nvemacs--selected-id id)))
+       ((and (eq nvemacs-searchbar-return-shows 'typed) (nvemacs--return-typed-empty-p))
+        (nvemacs--clear-pane))))))
+
 (defun nvemacs-searchbar-return ()
   "Return to nvEmacs from anywhere.
-Suggested global key: F8; `C-c )' in notes nvEmacs opened."
+Suggested global key: F8; `C-c )' in notes nvEmacs opened.
+`nvemacs-searchbar-return-shows' sets what the search line shows then."
   (interactive)
-  (cond
-   ((nvemacs--restore-l1-p)
-    (set-window-configuration (car (nvemacs--fparam 'nvemacs-l1)))
-    (nvemacs--set-fparam 'nvemacs-l1 nil)
-    (nvemacs--sweep)
-    (nvemacs--focus-query))
-   ((nvemacs--fparam 'nvemacs-active)
-    (when (nvemacs--fparam 'nvemacs-temp)        ; C-o's temporary pane collapses
-      (nvemacs--set-fparam 'nvemacs-temp nil)
-      (nvemacs--apply-layout))
-    (if (eq nvemacs-return-layout 'rebuild)
-        (unless (nvemacs--layout-intact-p) (nvemacs--apply-layout))
-      (unless (nvemacs--list-window) (switch-to-buffer nvemacs--buffer-name)))
-    (nvemacs--focus-query))
-   (t (nvemacs))))
+  (let* ((l1 (nvemacs--restore-l1-p))
+         (active (or l1 (nvemacs--fparam 'nvemacs-active)))
+         (id (and active (nvemacs--return-title-p) (nvemacs--return-note))))
+    (cond
+     (l1
+      (set-window-configuration (car (nvemacs--fparam 'nvemacs-l1)))
+      (nvemacs--set-fparam 'nvemacs-l1 nil)
+      (nvemacs--sweep)
+      (nvemacs--focus-query))
+     (active
+      (when (nvemacs--fparam 'nvemacs-temp)        ; C-o's temporary pane collapses
+        (nvemacs--set-fparam 'nvemacs-temp nil)
+        (nvemacs--apply-layout))
+      (if (eq nvemacs-return-layout 'rebuild)
+          (unless (nvemacs--layout-intact-p) (nvemacs--apply-layout))
+        (unless (nvemacs--list-window) (switch-to-buffer nvemacs--buffer-name)))
+      (nvemacs--focus-query))
+     (t (nvemacs)))
+    (when active (nvemacs--return-finish id))))
 
 (defun nvemacs--note-killed ()
   "Tidy up the frame after a note nvEmacs opened is killed.
@@ -4162,6 +4994,38 @@ arrangement is reset when nvEmacs quits."
     (with-current-buffer nvemacs--buffer-name (nvemacs--search))
     (message "nvEmacs: %d new, %d changed, %d deleted%s" (nth 0 r) (nth 1 r) (nth 2 r)
              (nvemacs--skip-summary))))
+
+(defun nvemacs-index-comments ()
+  "Turn comment search on or off, and say which it now is.
+Comments are in the index or not, so this asks, then rebuilds the index.
+The choice is kept in state.eld and survives a restart.  Answering no
+changes nothing."
+  (interactive)
+  (nvemacs--require-sqlite)
+  (nvemacs--comments-restore)
+  (let* ((on (nvemacs--comments-indexed-p))
+         (new (not on))
+         (word (lambda (v) (if v "on" "off"))))
+    (if (not (y-or-n-p (format "Turn comment search %s and rebuild the index? "
+                               (funcall word new))))
+        (message "nvEmacs: comment search stays %s" (funcall word on))
+      (let ((saved (assq 'search-comments (nvemacs--state-read)))
+            (before nvemacs-search-comments)
+            (done nil))
+        (nvemacs--state-write (cons (cons 'search-comments (if new 'on 'off))
+                                    (assq-delete-all 'search-comments (nvemacs--state-read))))
+        (unwind-protect
+            (progn (nvemacs-index-rebuild) (setq done t))
+          ;; A rebuild that stopped must not leave a choice it did not apply.
+          (unless done
+            (nvemacs--state-write (append (and saved (list saved))
+                                          (assq-delete-all 'search-comments (nvemacs--state-read))))
+            (setq nvemacs-search-comments before))))
+      ;; Previews change with comments, and a rebuild restarts the generation.
+      (nvemacs--kept-drop)
+      (let ((buf (get-buffer nvemacs--buffer-name)))
+        (when buf (with-current-buffer buf (nvemacs--search))))
+      (message "nvEmacs: comment search is %s" (funcall word new)))))
 
 (defun nvemacs--leave-frame (&optional frame)
   "Clear FRAME's nvEmacs state and restore its layout from before.
@@ -4400,7 +5264,8 @@ goes to the Trash."
     (unless (nvemacs--watched-note-p path)
       (nvemacs--command-error
        'nvemacs-note-new
-       (format "requires a note type in a watched folder, and %s is not" path)
+       (format "requires a note type in a watched folder, and %s is not"
+               (nvemacs--short-path path))
        "Check nvemacs-new-note-directory and the naming style, and then re-run the command"))
     (let ((missing nil))
       (unless existing
@@ -4428,11 +5293,11 @@ goes to the Trash."
               (goto-char (point-max))))))
       (nvemacs--open-path path)
       (when missing
-        (message "%s" (nvemacs--command-text
-                       'nvemacs-note-new
-                       (format "requires the template %s, which was not found, so the note starts blank"
-                               missing)
-                       "Set nvemacs-template-directory to the folder that holds it"))))))
+        (nvemacs--command-message
+         'nvemacs-note-new
+         (format "requires the template %s, which was not found, so the note starts blank"
+                 (nvemacs--short-path missing))
+         "Set nvemacs-template-directory to the folder that holds it")))))
 
 ;;;; Pending edits: a temp file until a save or leaving the note
 ;;
@@ -4930,7 +5795,8 @@ The note's file is written as usual: when the cursor leaves the note."
     ;; The file names where it would write: never outside the notes.
     (unless (nvemacs--watched-note-p path)
       (nvemacs--command-error
-       'nvemacs-edits-use (format "requires a note in a watched folder, and %s is not" path)
+       'nvemacs-edits-use (format "requires a note in a watched folder, and %s is not"
+                                  (nvemacs--short-path path))
        "Add its folder to nvemacs-watched-directories and then re-run the command"))
     (let ((buf (nvemacs--visit path)))
       (with-current-buffer buf
@@ -4983,30 +5849,55 @@ The note's file is written as usual: when the cursor leaves the note."
 
 (defun nvemacs--org-set-filetags (tags)
   "Make TAGS the `#+filetags:' of the Org text in the current buffer.
-An existing line keeps its keyword spelling; further lines merge into it.
-Otherwise the line goes between `#+Weather:' and `#+Notes:',
-else at the end of the leading keyword block, else at the top
-after a -*- line.  No tags leaves an empty line."
+Every existing line stays where it is: a tag that remains stays on its
+line, a removed tag comes off the line holding it, and a new tag goes on
+the first line.  A line whose tags do not change is left exactly as it
+is.  With no line, one goes between `#+Weather:' and `#+Notes:', else at
+the end of the leading keyword block, else at the top after a -*- line.
+No tags leaves an empty line."
   (let* ((case-fold-search t)
-         (value (if tags (concat ":" (mapconcat #'identity tags ":") ":") ""))
-         (limit (copy-marker (nvemacs--org-first-heading))))
+         (limit (copy-marker (nvemacs--org-header-end)))
+         (fold (lambda (tg) (nvemacs--fold (or (nvemacs--tag-normalize tg) tg))))
+         (left (copy-sequence tags))
+         (lines nil))
     (save-excursion
       (goto-char (point-min))
-      (if (re-search-forward "^#\\+filetags:\\([ \t]*\\)" limit t)
-          (let ((ws (if (string-empty-p (match-string 1)) " " (match-string 1))))
-            (delete-region (match-beginning 1) (line-end-position))
-            (insert ws value)
-            (forward-line 1)
-            (while (re-search-forward "^#\\+filetags:.*\n?" limit t)
-              (replace-match "")))
-        (goto-char (nvemacs--org-filetags-place limit))
-        (unless (bolp) (insert "\n"))
-        (insert "#+filetags: " value "\n")))
+      (while (re-search-forward "^[ \t]*#\\+filetags:\\([ \t]*\\)\\(.*\\)$" limit t)
+        (push (list (copy-marker (match-beginning 1)) (copy-marker (match-end 2) t)
+                    (match-string-no-properties 1)
+                    (split-string (match-string-no-properties 2) "[: \t]+" t))
+              lines))
+      (setq lines (nreverse lines))
+      (if (null lines)
+          (let ((value (if tags (concat ":" (mapconcat #'identity tags ":") ":") "")))
+            (goto-char (nvemacs--org-filetags-place limit))
+            (unless (bolp) (insert "\n"))
+            (insert "#+filetags: " value "\n"))
+        (let ((kept (mapcar
+                     (lambda (l)
+                       (cl-loop for tok in (nth 3 l)
+                                for tg = (cl-find (funcall fold tok) left
+                                                  :key fold :test #'equal)
+                                when tg collect tg and do (setq left (remq tg left))))
+                     lines)))
+          ;; One line takes TAGS as given; with several, new tags join the first.
+          (if (cdr lines)
+              (setcar kept (append (car kept) left))
+            (setq kept (list tags)))
+          (cl-mapc
+           (lambda (l new)
+             (unless (equal new (nth 3 l))
+               (goto-char (nth 0 l))
+               (delete-region (nth 0 l) (nth 1 l))
+               (insert (if (string-empty-p (nth 2 l)) " " (nth 2 l))
+                       (if new (concat ":" (mapconcat #'identity new ":") ":") ""))))
+           lines kept)))
+      (dolist (l lines) (set-marker (nth 0 l) nil) (set-marker (nth 1 l) nil)))
     (set-marker limit nil)))
 
 (defun nvemacs--org-filetags-place (limit)
   "Where a new `#+filetags:' line goes (see `nvemacs--org-set-filetags').
-Search no further than LIMIT."
+Search no further than LIMIT, the end of the header."
   (let ((case-fold-search t))
     (save-excursion
       (goto-char (point-min))
@@ -5015,11 +5906,15 @@ Search no further than LIMIT."
        ((progn (goto-char (point-min)) (re-search-forward "^#\\+notes:" limit t))
         (line-beginning-position))
        (t
+        ;; After any leading blank lines: above them, the new line would
+        ;; become a header of its own and cut off the real one.
         (goto-char (point-min))
+        (skip-chars-forward " \t\r\n")
+        (beginning-of-line)
         (when (looking-at ".*-\\*-.*-\\*-") (forward-line 1))
         (when (looking-at "[ \t]*:PROPERTIES:[ \t]*$")
-          (when (re-search-forward "^[ \t]*:END:[ \t]*$" limit t) (forward-line 1)))
-        (while (and (< (point) limit) (looking-at "#\\(?: \\)?\\+[A-Za-z_]+:"))
+          (goto-char (or (nvemacs--org-drawer-end) (point))))
+        (while (and (< (point) limit) (looking-at "[ \t]*#"))
           (forward-line 1))
         (point))))))
 
@@ -5031,8 +5926,8 @@ a comment)."
 
 (defun nvemacs--md-set-tags (tags)
   "Set the front-matter tags of the Markdown text in this buffer to TAGS.
-The form found is kept (flow, block, comma or space string, TOML); a
-missing key is added as `tags: [a, b]'.  No front matter is created."
+The form found is kept (flow, block, comma or space string, TOML, JSON);
+a missing key is added in that format.  No front matter is created."
   (let* ((fm (nvemacs--md-front-matter))
          (e (and fm (nvemacs--md-tags-entry fm)))
          (flow (concat "[" (mapconcat #'nvemacs--yaml-item tags ", ") "]"))
@@ -5041,6 +5936,11 @@ missing key is added as `tags: [a, b]'.  No front matter is created."
       (cond
        ((null fm)
         (when tags (goto-char (point-min)) (insert "---\ntags: " flow "\n---\n")))
+       ((and (null e) (eq (car fm) 'json))
+        (when tags
+          (let ((empty (string-blank-p (buffer-substring (nth 3 fm) (nth 4 fm)))))
+            (goto-char (nth 3 fm))
+            (insert "  \"tags\": " toml (if empty "\n" ",\n")))))
        ((null e)
         (when tags
           (goto-char (nth 4 fm))
@@ -5051,6 +5951,7 @@ missing key is added as `tags: [a, b]'.  No front matter is created."
         (insert
          (pcase (plist-get e :form)
            ('toml (concat "tags = " toml))
+           ('json (concat "\"tags\": " toml))
            ((guard (null tags)) "tags: []")
            ('flow (concat "tags: " flow))
            ('comma (concat "tags: " (mapconcat #'nvemacs--yaml-item tags ", ")))
@@ -5210,6 +6111,147 @@ cursor leaves the note or its row."
         (insert (format "\n%d tag(s). Search with tag:NAME or -tag:NAME.\n" (length rows))))
       (special-mode)
       (setq-local revert-buffer-function (lambda (&rest _) (nvemacs-tags-list)))
+      (goto-char (point-min))
+      (pop-to-buffer (current-buffer)))))
+
+;;;; Malformed notes: the report file
+;;
+;; Title, Created, Date and file tags have a meaning, so nvEmacs can say
+;; when one is misplaced or unreadable.  Any other key is arbitrary: a typo
+;; such as `#+Crated:' is just a key of that name.  The report is built from
+;; the index and never touches a note.
+
+(defconst nvemacs--malformed-sections
+  '(("title-outside" "Title outside the header"
+     "A =#+Title:= below the header does not set the note's title."
+     "Move it into the header, the block of lines before the first blank line.")
+    ("created-outside" "Created outside the header"
+     "A =#+Created:= below the header does not set the note's date."
+     "Move it into the header, the block of lines before the first blank line.")
+    ("date-outside" "Date outside the header"
+     "A =#+Date:= below the header does not set the note's date."
+     "Move it into the header, the block of lines before the first blank line.")
+    ("filetags-outside" "File tags outside the header"
+     "A =#+filetags:= below the header does not tag the note."
+     "Move it into the header, the block of lines before the first blank line.")
+    ("several-title" "More than one Title"
+     "The header has several titles, and nvEmacs uses the first."
+     "Keep one.")
+    ("several-created" "More than one Created"
+     "The header has several Created values, and nvEmacs uses the first it can read."
+     "Keep one.")
+    ("several-date" "More than one Date"
+     "The header has several Date values, and nvEmacs uses the first it can read."
+     "Keep one.")
+    ("unreadable-date" "No readable date"
+     "The note has a Created or Date, but none can be read as a date, so =created:= searches use a guess."
+     "Write it as YYYY-MM-DD, optionally with a time: 2026-11-23-10:30:45.")
+    ("missing-date" "Missing a date"
+     "The note has a header but no Created or Date, so =created:= searches use a guess."
+     "Add =#+Created: 2026-11-23-10:30:45= to the header, or =created:= to the front matter."))
+  "The report's sections: (KIND HEADING WHAT-IS-WRONG HOW-TO-FIX).")
+
+(defun nvemacs--malformed-file ()
+  "Return the path of the report of malformed notes."
+  (expand-file-name "malformed.org" nvemacs-data-directory))
+
+(defun nvemacs--malformed-path-p (path)
+  "Non-nil if PATH is the report itself, which is never indexed as a note."
+  (and (equal (file-name-nondirectory path) "malformed.org")
+       (equal (file-truename path) (file-truename (nvemacs--malformed-file)))))
+
+(defun nvemacs--malformed-counts ()
+  "Return (MALFORMED . MISSING), how many notes have each kind of problem."
+  (let ((row (car (sqlite-select
+                   (nvemacs--db)
+                   "SELECT count(DISTINCT CASE WHEN kind <> 'missing-date' THEN id END), count(DISTINCT CASE WHEN kind = 'missing-date' THEN id END) FROM problems"))))
+    (cons (car row) (cadr row))))
+
+(defun nvemacs--malformed-summary ()
+  "Return the report's counts for reading."
+  (let ((c (nvemacs--malformed-counts)))
+    (format "%s malformed, %s missing a date"
+            (nvemacs--group-digits (car c)) (nvemacs--group-digits (cdr c)))))
+
+(defun nvemacs--malformed-entry (path line detail)
+  "Return the report's line for note PATH, at LINE, with DETAIL."
+  (concat "- "
+          (if (string-match-p "[][\n]" path)
+              path
+            (format "[[file:%s%s][%s]]" path (if line (format "::%d" line) "") path))
+          (if line (format " (line %d)" line) "")
+          (if detail (format ": %s" (string-replace "\n" " " detail)) "")
+          "\n"))
+
+(defun nvemacs--malformed-text ()
+  "Return the text of the report, from the index."
+  (let ((db (nvemacs--db)))
+    (with-temp-buffer
+      (insert "#+Title: nvEmacs malformed notes\n#+STARTUP: showall\n\n"
+              "nvEmacs writes this file from its index.  It never edits your notes, and\n"
+              "changes made here are overwritten.\n\n"
+              (nvemacs--malformed-summary) ".\n")
+      (let ((any nil))
+        (pcase-dolist (`(,kind ,heading ,what ,fix) nvemacs--malformed-sections)
+          (let ((rows (sqlite-select
+                       db "SELECT m.path, p.line, p.detail FROM problems p JOIN meta m ON m.id = p.id WHERE p.kind = ? ORDER BY m.path, p.line"
+                       (list kind))))
+            (when rows
+              (setq any t)
+              (insert (format "\n* %s (%d)\n\n%s\nTo fix: %s\n\n" heading (length rows) what fix))
+              (dolist (r rows) (insert (apply #'nvemacs--malformed-entry r))))))
+        (unless any (insert "\nNothing to report.\n")))
+      (buffer-string))))
+
+(defun nvemacs--malformed-write ()
+  "Write the report if its text changed; return the file."
+  (let ((file (nvemacs--malformed-file)) (text (nvemacs--malformed-text)))
+    (unless (and (file-readable-p file)
+                 (equal text (with-temp-buffer
+                               (let ((coding-system-for-read 'utf-8)) (insert-file-contents file))
+                               (buffer-string))))
+      (nvemacs--private-directory (file-name-directory file))
+      (with-temp-buffer (insert text) (nvemacs--write-file file)))
+    file))
+
+(defun nvemacs--malformed-save ()
+  "Write the report.  An error here never stops a rebuild, scan or exit."
+  (when nvemacs--db
+    (with-demoted-errors "nvEmacs: writing malformed.org: %S"
+      (nvemacs--malformed-write))))
+
+(defun nvemacs-index-malformed ()
+  "Write and show malformed.org: notes whose header needs attention.
+The report lists them by problem, with how to fix each.  nvEmacs never
+edits those notes."
+  (interactive)
+  (let* ((file (nvemacs--malformed-write))
+         (buf (find-buffer-visiting file)))
+    (if buf
+        (with-current-buffer buf (revert-buffer t t t))
+      (setq buf (find-file-noselect file)))
+    (with-current-buffer buf (setq buffer-read-only t))
+    (pop-to-buffer buf)
+    file))
+
+;;;; Keys
+
+(defun nvemacs-keys-list ()
+  "List every key in the notes with how many notes use it, and where."
+  (interactive)
+  (let ((rows (sqlite-select
+               (nvemacs--db)
+               "SELECT min(key), count(DISTINCT id), sum(kind = 'header'), sum(kind = 'body') FROM fields WHERE fkey IS NOT NULL GROUP BY fkey ORDER BY 2 DESC, 1")))
+    (with-current-buffer (get-buffer-create "*nvEmacs keys*")
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "%-24s %5s  %s\n" "Key" "Notes" "uses in header / body"))
+        (dolist (r rows)
+          (insert (format "%-24s %5d  %d / %d\n" (nth 0 r) (nth 1 r) (nth 2 r) (nth 3 r))))
+        (insert (format "\n%d key(s). Search with key:NAME or -key:NAME, and values with meta:WORD.\n"
+                        (length rows))))
+      (special-mode)
+      (setq-local revert-buffer-function (lambda (&rest _) (nvemacs-keys-list)))
       (goto-char (point-min))
       (pop-to-buffer (current-buffer)))))
 
@@ -5701,13 +6743,19 @@ in a buffer you had open before nvEmacs must be saved or reverted first."
 ;;;; Home page
 ;;
 ;; A plain Org or Markdown file in the data directory, built from a template
-;; when nvEmacs exits and shown in the note pane at launch.  Org pages are
+;; when nvEmacs exits, or at the first launch of a new version, and shown in
+;; the note pane at launch.  Org pages are
 ;; rendered by Org, loaded only after the list is on screen (about 200 ms).
 ;; Markdown pages use a small viewer: markdown-mode is not part of Emacs.
 ;; What a crash could make stale (edits to recover) is worked out at launch
 ;; and shown above the file, never stored in it.
 
 (defconst nvemacs-version (package-get-version) "The version of nvEmacs.")
+
+(defun nvemacs-version ()
+  "Show the version of nvEmacs that is running."
+  (interactive)
+  (message "nvEmacs %s" (or nvemacs-version "unknown")))
 
 (defcustom nvemacs-homepage-file nil
   "File of the live home page.
@@ -5952,6 +7000,8 @@ The table is in Markdown if MD."
               "not recorded"))
       ("list-time" . ,(nvemacs--homepage-times :list-ms))
       ("index-ready" . ,(nvemacs--homepage-times :ready-ms))
+      ("malformed-file" . ,(nvemacs--malformed-file))
+      ("malformed-count" . ,(nvemacs--malformed-summary))
       ("recent" . ,(nvemacs--homepage-recent md))
       ("commands" . ,(nvemacs--homepage-commands md)))))
 
@@ -5964,9 +7014,12 @@ The values go in as written, and an unknown placeholder is left alone."
    template t t))
 
 (defun nvemacs--homepage-write ()
-  "Write the home page file from its template; return the file, or nil."
+  "Write the home page file from its template; return the file, or nil.
+The version writing it is remembered, so a later version can tell the
+saved page is not its own."
   (let ((tpl (nvemacs--homepage-template-file)) (file (nvemacs--homepage-file)))
     (when tpl
+      (nvemacs--malformed-save)         ; the page links to it
       (let ((text (nvemacs--homepage-expand
                    (with-temp-buffer
                      (let ((coding-system-for-read 'utf-8)) (insert-file-contents tpl))
@@ -5974,6 +7027,10 @@ The values go in as written, and an unknown placeholder is left alone."
                    (nvemacs--homepage-values (nvemacs--homepage-md-p)))))
         (nvemacs--private-directory (file-name-directory file))
         (with-temp-buffer (insert text) (nvemacs--write-file file))
+        (let ((state (nvemacs--state-read)))
+          (unless (equal (alist-get 'homepage-version state) nvemacs-version)
+            (nvemacs--state-write (cons (cons 'homepage-version nvemacs-version)
+                                        (assq-delete-all 'homepage-version state)))))
         file))))
 
 (defun nvemacs--homepage-save ()
@@ -5983,9 +7040,14 @@ The values go in as written, and an unknown placeholder is left alone."
       (nvemacs--homepage-write))))
 
 (defun nvemacs--homepage-text ()
-  "Return the home page's text, first writing it if missing or out of date."
+  "Return the home page's text, first writing it if it needs it.
+That is when it is missing, older than its template, or saved by another
+version of nvEmacs."
   (let ((file (nvemacs--homepage-file)) (tpl (nvemacs--homepage-template-file)))
-    (when (and tpl (or (not (file-exists-p file)) (file-newer-than-file-p tpl file)))
+    (when (and tpl (or (not (file-exists-p file))
+                       (file-newer-than-file-p tpl file)
+                       (not (equal (alist-get 'homepage-version (nvemacs--state-read))
+                                   nvemacs-version))))
       (nvemacs--homepage-write))
     (when (file-readable-p file)
       (with-temp-buffer
@@ -6000,6 +7062,7 @@ A crash skips the exit write, so none of this can be stored in it."
          (plural (lambda (n one many) (format "%d %s" n (if (= n 1) one many))))
          (pending (length (nvemacs--pending-records)))
          (orphans (if (plist-get run :checked) (length (nvemacs--orphan-tag-files)) 0))
+         (malformed (car (nvemacs--malformed-counts)))
          (attention
           (append
            (when (> pending 0)
@@ -6009,6 +7072,9 @@ A crash skips the exit write, so none of this can be stored in it."
              (list (concat (funcall plural (length nvemacs--skipped)
                                     "note could not be indexed" "notes could not be indexed")
                            ": M-x nvemacs-index-skipped")))
+           (when (> malformed 0)
+             (list (concat (funcall plural malformed "note is malformed" "notes are malformed")
+                           ": M-x nvemacs-index-malformed")))
            (mapcar (lambda (d) (concat "Watched folder not found: " d))
                    (cl-remove-if #'file-directory-p nvemacs-watched-directories))
            (when (> orphans 0)
@@ -6033,12 +7099,15 @@ A crash skips the exit write, so none of this can be stored in it."
 (defun nvemacs--homepage-open-path (path)
   "Open note PATH from the home page.
 The page is a plain file, so a path outside the notes is refused."
-  (if (and (file-regular-p path) (nvemacs--watched-note-p path))
-      (nvemacs--open-path path)
-    (message "%s" (nvemacs--command-text
-                   'nvemacs-homepage-open-link
-                   (format "requires a note in a watched folder, and %s is not" path)
-                   "Press g to refresh the page and then try another link"))))
+  (cond
+   ((nvemacs--malformed-path-p path) (nvemacs-index-malformed))
+   ((and (file-regular-p path) (nvemacs--watched-note-p path))
+    (nvemacs--open-path path))
+   (t
+    (nvemacs--command-message
+     'nvemacs-homepage-open-link
+     (format "requires a note in a watched folder, and %s is not" (nvemacs--short-path path))
+     "Press g to refresh the page and then try another link"))))
 
 (defun nvemacs--homepage-link-path ()
   "Return the path of the Org note link at point, or nil."
@@ -6187,13 +7256,14 @@ With `nvemacs-instrumentation' on, a start that builds the list is
 measured and logged (startup.jsonl)."
   (interactive)
   (nvemacs--require-sqlite)              ; before anything is created
+  (nvemacs--comments-restore)            ; before an index may be built
   (let* ((t0 (float-time))
          (call-time (current-time))
          (rebuilt (unless (and (file-exists-p (nvemacs--index-path)) (nvemacs--index-current-p))
                     (message "nvEmacs: building the index…")
                     (nvemacs-index-rebuild)
                     t))
-         (index-ms (progn (nvemacs--ensure-match-width) (nvemacs--ms t0)))
+         (index-ms (progn (nvemacs--ensure-match-width) (nvemacs--comments-check) (nvemacs--ms t0)))
          (new (not (get-buffer nvemacs--buffer-name))))
     (nvemacs--sync-enable)
     (nvemacs--grow-enable)

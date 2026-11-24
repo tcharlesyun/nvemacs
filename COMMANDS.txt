@@ -1,10 +1,10 @@
-nvEmacs 0.0.3 — Commands
-========================
+nvEmacs — Commands
+==================
 
 Command names are nvemacs-OBJECT-VERB, so M-x nvemacs-tags- TAB lists
 every tag command.  The objects are Notational Velocity's three areas —
 searchbar, notelist, notecontent — plus note (a note file), layout,
-index, tags, report, edits and homepage.
+index, tags, keys, report, edits and homepage.
 
 
 Keys in *nvEmacs*
@@ -59,8 +59,18 @@ While a row is selected, the search line shows that note's title (its
 bold part).  Typing starts a new search; DEL, or moving back to the search
 line, brings back what you had typed.
 
+Returning with F8 puts the cursor on the search line with your search.
+With nothing typed, the note pane clears too.  The setting
+nvemacs-searchbar-return-shows can keep the note and show its title
+instead (see SETTINGS.txt, Layout).
+
+Error messages name a file by its filename and the last 20 characters of
+its folder, to stay short: a.org <...one/notes/work/2026/>.  *Messages*
+(C-h e) always has the full path.
+
 Scroll bar, wheel and trackpad move only the view; the selected note
-stays.  See README.txt, "The selected note and the view".
+stays, and the search line stays at the top.  Clicking it there goes back
+to it.  See README.txt, "The selected note and the view".
 
 
 Keys in notes opened by nvEmacs (nvemacs-note-mode, " nv")
@@ -94,7 +104,8 @@ Starting and leaving
   nvemacs-searchbar-return        Return to nvEmacs from anywhere (F8,
                                   C-c ) in notes).
   nvemacs-quit                    Exit nvEmacs (C-c C-]).
-  nvemacs-homepage-show           Show the home page, up to date.  On the
+  nvemacs-version                 Show the version of nvEmacs.
+  nvemacs-homepage-show          Show the home page, up to date.  On the
                                   page: RET opens a note, g refreshes,
                                   q returns to the search line.
   nvemacs-homepage-open-link      Open the note whose title is at point (RET
@@ -183,6 +194,17 @@ Index
                                   dates.eld).
   nvemacs-index-skipped           List the notes that could not be indexed,
                                   and why (too large, binary, not UTF-8).
+  nvemacs-index-comments          Turn comment search on or off.  It asks,
+                                  rebuilds the index, remembers the choice
+                                  and says which state it is now in.
+  nvemacs-index-malformed         Write and show malformed.org: notes whose
+                                  header needs attention, by problem, with
+                                  how to fix each.  It never edits them.
+
+Keys
+
+  nvemacs-keys-list               List every key in the notes, with how many
+                                  notes use it and where (*nvEmacs keys*).
 
 Reports (each opens *nvEmacs report*)
 
@@ -215,9 +237,15 @@ Search syntax
 
   whale ishmael     notes containing both, anywhere, as parts of words
   my_note           only "my_note": % and _ are plain characters too
+  "blue whale"      that phrase, even across a line break
+  -whale            notes without "whale" ("-whale" is the literal text)
   tag:work          notes with a tag starting with "work"
   -tag:old          leave out notes with a tag starting with "old"
+  key:notes         notes with a key whose name starts with "notes"
+  meta:whale        notes with "whale" in a key's value or a header comment
+  created:2026-11   notes created in November 2026 (also added:, modified:)
+  "key:string"      the literal text, not a prefix
 
-Case and accents are ignored.  In the default sort, title matches (the
+USAGE.txt has every form, with examples.  Case and accents are ignored.  In the default sort, title matches (the
 first 60 columns of a title) come first, then the other matches, each
 group newest first.  Any other sort orders every match by its column.

@@ -22,6 +22,10 @@ Last updated {written}.
 - First screen of the notelist: {list-time}
 - Index ready: {index-ready}
 
+## Note format
+
+- [malformed.org](<file:{malformed-file}>): {malformed-count}
+
 ## Versions
 
 - nvEmacs {version}, Emacs {emacs-version}, SQLite {sqlite-version}
@@ -31,6 +35,11 @@ Last updated {written}.
 - Type words: a note matches when it contains all of them, in any order.
 - `tag:work` lists notes with a tag starting with "work".
 - `-tag:old` leaves out notes with a tag starting with "old".
+- `"blue whale"` finds that phrase, even across a line break.
+- `-whale` leaves out notes with that word, and `"-whale"` is the literal text.
+- `key:notes` lists notes with that key, and `meta:whale` searches key values.
+- `created:2026-11` lists notes by date.  Also `added:` and `modified:`.
+- `USAGE.txt` in the nvEmacs folder has every form, with examples.
 
 ## Keys
 

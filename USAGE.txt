@@ -1,0 +1,172 @@
+nvEmacs — Usage
+===============
+
+How to search.  Case and accents are ignored everywhere.  See COMMANDS.txt
+for keys and SETTINGS.txt for settings.
+
+
+Simple search
+-------------
+
+  whale             notes containing "whale", also inside longer words
+  whale ishmael     notes containing both, anywhere, in any order
+  "blue whale"      that exact phrase, even when a line break splits it
+
+Plain words search a note's title and body.  They do not search its
+header, keys or comments.
+
+
+Leaving notes out
+-----------------
+
+A minus sign in front of a word, a quoted phrase or a search prefix leaves
+those notes out.
+
+  -whale            notes without "whale"
+  -"blue whale"     notes without that phrase
+  whale -ishmael    notes with "whale" but not "ishmael"
+  -5                notes without "5"
+  -tag:old          leave out notes with a tag starting with "old"
+  -key:draft        leave out notes that have a key named "draft"
+  -meta:whale       leave out notes with "whale" in a key's value
+  -created:2026-11  leave out notes created in November 2026
+
+A word follows the same rule as plain search: -whale looks at the title and
+body, not the header, keys or comments.
+
+The minus means NOT only at the start of a word, and only before a letter,
+digit or quote.  To search for text that starts with a hyphen, put it in
+quotes.  There is no backslash escape.
+
+  "-whale"          the text -whale
+  "-5"              the text -5
+  "-"               a hyphen
+  well-known        the text well-known: the hyphen is inside the word
+  --verbose         the text --verbose: another hyphen follows the first
+  ->                the text ->: a symbol follows the hyphen
+  -                 ignored while you are still typing
+
+
+Search prefixes
+---------------
+
+  tag:     a tag, by the start of its name
+  key:     a key's name, by its start
+  meta:    the value of any key, or a comment in the header
+  created: the note's Created date
+  added:   the date nvEmacs first saw the file
+  modified: the date the file last changed
+
+Any other word with a colon, such as http:, is plain text.  To search for
+text that looks like a prefix, put it in quotes:
+
+  key:string        notes with a key whose name starts with "string"
+  "key:string"      notes containing the text key:string
+
+
+Keys and values
+---------------
+
+A key is a named field: #+Notes: in Org, or notes: in Markdown front matter.
+Every key is captured, including ones you invent.  M-x nvemacs-keys-list
+shows them all.
+
+  key:notes         notes that have a key named Notes
+  meta:whale        notes with "whale" in any key's value
+  meta:"blue whale" notes with that phrase in any key's value
+  key:"date created"  a key name with a space in it
+
+Be careful when combining the two:
+
+  key:notes meta:whale
+
+This finds notes that have a Notes key AND have "whale" in some value.  The
+whale may be in a different key, such as Author.  A search cannot be limited
+to the value of one key.
+
+Nested front matter is stored with dots, so author: followed by an indented
+name: is the key author.name.  key:author finds it, and each item of a list
+is its own value.
+
+Org keys count anywhere in a note, except inside source, example and export
+blocks.  meta: finds their values wherever they are.
+
+
+Dates
+-----
+
+created:, added: and modified: take the same forms.  Both ends of a range
+are included, and a partial date means its whole span.
+
+  created:2026                 all of 2026
+  created:2026-11              November 2026
+  created:2026-11-23           that day
+  created:2026-10..2026-12     October through December
+  created:2026-01-15..2026-02  January 15 through February 28
+  created:>=2026-01            January 2026 or later
+  created:<2026-01             before January 2026
+  created:-30d                 the last 30 days (also w, m, y)
+  created:2026-11~1m           one month either side: October through December
+  created:2026-01-15~15        15 days either side: Dec 31 through Jan 30
+  created:2027-01-01>1m        forward one month: Jan 1 through Feb 1, 2027
+  created:2027-01-01<1m        back one month: Dec 1, 2026 through Jan 1, 2027
+
+A number with no unit takes the date's precision: days for a full date,
+months for 2026-11 and years for 2026.  A date that cannot be read, such as
+created:2026-13, finds nothing, and the status line says why.
+
+
+Created and Date
+----------------
+
+A note's date comes from its header.  In Org, the header is the block of
+lines before the first blank line.  In Markdown, it is the front matter.
+
+Created is used first, then Date.  nvEmacs writes new notes with both:
+
+  #+Created:  2026-11-23-10:30:45
+  #+Date:     [2026-11-23 Mon 10:30]
+
+In Markdown:
+
+  created: 2026-11-23-10:30:45
+  date: 2026-11-23T10:30:45-05:00
+
+Created is nvEmacs's own key.  Date is in the form Org or Markdown tools
+expect, and those tools may change it.  nvEmacs cannot do anything if an
+outside tool changes either key.
+
+A time zone offset is accepted but not required.  A date without one is
+local time wherever you are, and it shows and matches as written.
+
+
+Comments
+--------
+
+Comments are left out of plain search.  M-x nvemacs-index-comments turns
+comment search on or off.  It asks before rebuilding the index, remembers
+your choice and says which state it is now in.
+
+  Org        a line starting with "# ", or #+begin_comment to #+end_comment
+  Markdown   <!-- to -->, which may span lines
+  Text       no comments: every line is searched
+
+A comment in an Org header is always header: meta: finds it, and plain
+search does not.  In Org, "* COMMENT" is an ordinary section.
+
+
+Malformed notes
+---------------
+
+nvEmacs lists notes whose header needs attention in malformed.org, in
+nvemacs-data-directory.  The home page links to it, and
+M-x nvemacs-index-malformed writes and opens it.  Each section says what is
+wrong and how to fix it.  nvEmacs never edits those notes.
+
+  - Title, Created, Date or file tags outside the header
+  - More than one Title, Created or Date in the header
+  - A Created or Date with no readable date in the note
+  - A header with no Created or Date (listed as missing a date)
+
+Other keys can hold anything.  A misspelled #+Crated: is simply a key named
+Crated, so that note is listed as missing a date.

@@ -1,7 +1,8 @@
 ---
 title: {title}
 author: {author}
-created: {time:%Y-%m-%d-%Hh%Mm}
+created: {time:%Y-%m-%d-%H:%M:%S}
+date: {time:%Y-%m-%dT%H:%M:%S%:z}
 filename: {path}
 weather: 
 tags: []

@@ -1,7 +1,8 @@
 #+emacs:    <!-- ; -*-Org-*- -->
 #+Title:    {title}
 #+Author:   {author}
-#+Created:  {time:%Y-%m-%d-%Hh%Mm}
+#+Created:  {time:%Y-%m-%d-%H:%M:%S}
+#+Date:     {time:[%Y-%m-%d %a %H:%M]}
 #+STARTUP:  hidestars
 #+STARTUP:  odd
 #+OPTIONS:  padline:no

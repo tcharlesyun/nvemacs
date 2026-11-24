@@ -1,5 +1,5 @@
-nvEmacs 0.0.3 — Settings
-========================
+nvEmacs — Settings
+==================
 
 Set these in your init file before M-x nvemacs, for example
 
@@ -28,6 +28,14 @@ nvemacs-import-extensions             default ("org" "md" "txt")
 nvemacs-import-max-size               default 10485760 (10 MB)
     Larger notes are skipped and listed by M-x nvemacs-index-skipped.
 
+nvemacs-search-comments               default nil
+    Non-nil puts comments in a note's body into plain search: Org "# "
+    lines and comment blocks, Markdown <!-- -->.  A comment in an Org
+    header stays out either way.  M-x nvemacs-index-comments turns it on
+    or off, rebuilds the index and remembers the choice in state.eld.  That
+    choice then wins over this value.  Set here, a change needs an index
+    rebuild, which nvEmacs offers at its next start.
+
 
 Titles and dates
 ----------------
@@ -50,9 +58,12 @@ nvemacs-title-match-width             default 60
 nvemacs-filename-timestamp-regexp     default yyyy-mm-dd-HHhMMm-
     Leading timestamp removed from filenames used as titles.
 
-Created dates (no setting): a note's own date — Org #+created:, a
-:CREATED: property, #+date:; Markdown created:, date:; a date at the
-start of the filename.  Otherwise its Added date, shown with a ~.
+Created dates (no setting): a note's own date, read only from its header
+(in Org, the lines before the first blank line) or front matter — Org
+#+created:, a :CREATED: property, #+date:; Markdown created:, date:.  Then
+a date at the start of the filename.  Otherwise its Added date, shown with
+a ~.  A date with no time zone is local wherever you are, and shows as
+written.  nvEmacs cannot do anything if an outside tool changes these keys.
 
 Added dates (no setting): the earlier of the file's creation and modified
 dates when nvEmacs first finds it, kept in nvemacs-dates-file.  It never
@@ -139,6 +150,18 @@ nvemacs-return-layout                 default rebuild
     rebuild: restore nvEmacs's arrangement.  respect: keep your windows
     and only show the list.
 
+nvemacs-searchbar-return-shows        default typed
+    What the search line shows when you return to nvEmacs (F8, C-c ) in
+    a note).
+      typed           the search you typed; with nothing typed, the note
+                      pane clears too
+      typed-or-title  the search you typed; with nothing typed, the note
+                      stays selected and its title shows
+      title           the note stays selected and its title shows, even
+                      over a typed search, as in Notational Velocity
+    While a title shows, typing starts a new search and DEL brings back
+    the one you typed.
+
 
 New notes
 ---------
@@ -193,9 +216,12 @@ nvemacs-homepage-template             default "homepage.org"
     looked up among the shipped ones.
 
 nvemacs-homepage-file                 default nil = homepage.org in the data directory
-    The live page, which nvEmacs overwrites when it exits.  With nil the
-    extension follows the template.  Keep it out of the watched folders,
-    or it is indexed as a note.
+    The live page, which nvEmacs overwrites at exit and after an upgrade.
+    With nil the extension follows the template.  Keep it out of the
+    watched folders, or it is indexed as a note.
+
+malformed.org (no setting) is written to nvemacs-data-directory and linked
+from the home page.  It lists notes whose header needs attention.
 
 
 Keeping the index up to date
@@ -250,7 +276,8 @@ nvemacs-dates-file                    default nil = dates.eld in the data direct
     Dropbox).  Keep it: it cannot be rebuilt from the notes.
 
 nvemacs-state-file                    default nil = state.eld in the data directory
-    Remembered values (the tags column width, the sort).  Safe to delete.
+    Remembered values (the tags column width, the sort, the version that
+    wrote the home page).  Safe to delete.
 
 nvemacs-instrumentation               default on (global minor mode)
     Log each start, session and re-scan: counts and timings only, never

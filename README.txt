@@ -1,5 +1,5 @@
-nvEmacs 0.0.3
-=============
+nvEmacs
+=======
 
 Notational Velocity-style note search for Emacs.
 
@@ -10,8 +10,9 @@ you typed.  Notes are ordinary files (Org, Markdown, plain text) in folders
 you choose.  nvEmacs is pure Emacs Lisp; the search index is a SQLite FTS5
 trigram database that Emacs opens directly.
 
-This is version 0.0.3 (2026-11-23).
+M-x nvemacs-version shows the version you are running.
 
+  USAGE.txt            how to search, with examples
   COMMANDS.txt         keys and M-x commands
   SETTINGS.txt         every setting, with its default
   LICENSE.txt          the GNU General Public License, version 3
@@ -104,8 +105,9 @@ nvEmacs uses Notational Velocity's three areas:
 Each notelist row shows the title (its first 60 columns in bold), the
 rest of a long title and then the note's text as one grey line, then
 tags and dates in columns.  The columns and their order are a setting;
-the header line names them, and the mode line shows the status ("20 of
-4,782 Newest notes displayed", "12 shown · screen full · 6 ms").
+the row above the search line names them, and the mode line shows the
+status ("20 of 4,782 Newest notes displayed", "12 shown · screen full ·
+6 ms").
 
 With an empty search the list shows the newest notes and, while the
 cursor is in the notelist, grows by a screenful each half second you pause,
@@ -192,9 +194,9 @@ area says "No note selected".  M-x nvemacs-homepage-show brings it back,
 up to date.
 
 The page is a plain Org file, rendered by Org and rewritten when nvEmacs
-exits, so change the template rather than the page: copy
-templates/homepage.org to your nvemacs-template-directory and edit it.  For
-Markdown, use homepage.md:
+exits or first starts at a new version, so change the template rather than
+the page: copy templates/homepage.org to your nvemacs-template-directory
+and edit it.  For Markdown, use homepage.md:
 
     (setq nvemacs-homepage-template "homepage.md")
 
@@ -286,6 +288,10 @@ When the selected row is off screen:
 
 With no note selected, scrolling selects nothing, and a keyboard move
 starts from the rows on screen.
+
+The search line stays on screen while you scroll.  Once the list moves
+past it, a read-only copy holds its place.  Typing, or clicking the copy,
+goes to the real search line and brings the list back to the top.
 
 
 Notes, titles and dates
@@ -464,8 +470,9 @@ and every file in it too: the index holds the text of every note.
                   to their notes.  Each is removed once its note is
                   written.
   discarded/      edits you chose to discard, kept for 7 days.
-  homepage.org    the home page, rewritten when nvEmacs exits.  It lists
-                  note titles and paths.  Move it with nvemacs-homepage-file.
+  homepage.org    the home page, rewritten at exit and after an upgrade.
+                  It lists note titles and paths.  Move it with
+                  nvemacs-homepage-file.
   session-times.eld  index and notelist timings of the last 20 sessions.
   nvemacs-log/    small measurement logs (startup, sessions, syncs), each
                   capped at 10 KB: counts and timings only, never note
