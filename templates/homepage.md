@@ -38,8 +38,15 @@ Last updated {written}.
 - `"blue whale"` finds that phrase, even across a line break.
 - `-whale` leaves out notes with that word, and `"-whale"` is the literal text.
 - `key:notes` lists notes with that key, and `meta:whale` searches key values.
+- `dir:work` lists the notes in a folder starting with "work", and its subfolders.
 - `created:2026-11` lists notes by date.  Also `added:` and `modified:`.
 - `USAGE.txt` in the nvEmacs folder has every form, with examples.
+
+## Search History
+
+- Search history: {history-state}
+- Searches kept: {history-count}
+- History file: {history-file}
 
 ## Keys
 

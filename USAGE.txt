@@ -30,6 +30,7 @@ those notes out.
   -key:draft        leave out notes that have a key named "draft"
   -meta:whale       leave out notes with "whale" in a key's value
   -created:2026-11  leave out notes created in November 2026
+  -dir:archive      leave out notes in a folder starting with "archive"
 
 A word follows the same rule as plain search: -whale looks at the title and
 body, not the header, keys or comments.
@@ -53,6 +54,7 @@ Search prefixes
   tag:     a tag, by the start of its name
   key:     a key's name, by its start
   meta:    the value of any key, or a comment in the header
+  dir:     a folder, and every folder inside it
   created: the note's Created date
   added:   the date nvEmacs first saw the file
   modified: the date the file last changed
@@ -90,6 +92,44 @@ is its own value.
 
 Org keys count anywhere in a note, except inside source, example and export
 blocks.  meta: finds their values wherever they are.
+
+
+Folders
+-------
+
+dir: lists the notes in a folder, including its subfolders.  Words narrow
+the list.  The folders are your watched folders and every folder inside
+them.  Case is ignored.
+
+  dir:work          a folder whose name starts with "work"
+  dir:work/         the folder named exactly "work"
+  dir:work whale    notes with "whale" in those folders
+  dir:2026/work     a folder starting with "work" right inside "2026"
+  dir:notes/2026/   folders named "2026" right inside "notes"
+  -dir:archive      every note except those in such folders
+
+Without a trailing slash, the last part is the start of a name, and it
+matches only a watched folder or a folder inside one.  With a trailing
+slash, every part is a whole name, and the names may be anywhere in the
+folder's path, even above the watched folder.
+
+For example, with these watched folders:
+
+  this/is/path/to/directory1
+  path/to/directory2
+  a/b/third
+
+  dir:direc         directory1 and directory2
+  dir:th            third, but not "this", which is above directory1
+  dir:b/thi         third
+  dir:path/to/      directory1 and directory2
+  dir:is/           directory1
+
+To mean exactly one place, start with / or ~, and the path is matched from
+the start:
+
+  dir:~/path/to/    only directory2, if that is where it is
+  dir:"~/My Notes/" quotes for a name with a space
 
 
 Dates
@@ -153,6 +193,55 @@ your choice and says which state it is now in.
 
 A comment in an Org header is always header: meta: finds it, and plain
 search does not.  In Org, "* COMMENT" is an ordinary section.
+
+
+Search history
+--------------
+
+nvEmacs records your searches so you can look back at them and run them
+again.  History is on for now, while it is being tested.  M-x
+nvemacs-searchbar-history turns it on or off, remembers the choice and says
+which state it is in.  Turning it off asks first, then deletes the history
+file.
+
+  M-p          on the search line: the previous search
+  M-n          on the search line: the next one, then what you had typed
+
+  >>> M-p and M-n work only on the search line.  On a result row, and in
+  >>> your notes, they keep their usual meaning.
+
+M-x nvemacs-searchbar-history-list shows past searches in place of the
+notelist, newest first, with a colored bar down the left so it is not
+mistaken for your notes.  Type to filter them, with words, "quotes" and
+-word as in search.  On a row, RET runs that search, d deletes it from the
+history, and q returns.  C-c C-c also returns.  Each row shows the time,
+how many times it was run (x3), how it ended, and how many rows it showed.
+A + after that number means more matches were still being found.
+
+What counts as one search:
+
+  - Typing adds to the search in progress, however long you pause.
+  - Deleting within a second of your last keystroke fixes a typo.
+  - Deleting after a pause of a second or more starts a new search.
+  - A search ends when you open a note, edit one, clear the search line or
+    quit.  It is then written to the history.
+  - Moving through rows, scrolling or resting on a note does not end it.
+  - The title shown for a selected row is never recorded.
+
+Running a search again moves it to the top and counts it, rather than adding
+a copy.  Searches differing only in case or spaces count as the same one.
+The history keeps the newest 100 distinct searches
+(nvemacs-searchbar-history-size).
+
+The file is history.jsonl in nvemacs-data-directory, readable only by you,
+one search per line in JSON after a first line that describes it.  Two
+limits are worth knowing:
+
+  - Deleting the file does not guarantee the text is gone.  On a Mac,
+    overwriting usually writes new blocks, and snapshots, Time Machine or a
+    synced folder may keep copies.
+  - Two Emacs sessions running nvEmacs share one file, and a search can
+    occasionally be lost.
 
 
 Malformed notes

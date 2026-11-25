@@ -6,15 +6,20 @@ Set these in your init file before M-x nvemacs, for example
     (setq nvemacs-watched-directories '("~/notes/" "~/journal/")
           nvemacs-notelist-columns "title, tags, created, modified")
 
-or with M-x customize-group RET nvemacs RET.  Settings live in your init
-file or custom-file; nvEmacs never writes them anywhere else.
+or with M-x customize-group RET nvemacs RET.  nvEmacs never writes your
+init file or custom-file.  Choices made with nvEmacs commands (the watched
+folders, a tags column width, comment search, search history) are kept in
+settings.eld in nvemacs-data-directory; a setting in your init file wins.
 
 
 Notes and indexing
 ------------------
 
-nvemacs-watched-directories           default ("~/notes/")
-    Folders whose notes are indexed.
+nvemacs-watched-directories           default nil
+    Folders whose notes are indexed.  Leave it unset: nvEmacs asks at its
+    first start and keeps them in settings.eld, and M-x
+    nvemacs-index-folder-add and nvemacs-index-folder-remove change them.
+    Set here, this list wins, and those commands say to change it here.
 
 nvemacs-watched-directories-recursive  default t
     Also index notes in subfolders.
@@ -99,13 +104,13 @@ nvemacs-notelist-remember-widths      default last
       last   measured from the first screen, then saved when nvEmacs
              closes and on C-c C-l, and used at the next start
       never  measured from the first screen each time; nothing saved
-      user   always nvemacs-notelist-tags-width; C-c C-l then lasts for
-             the session only
+      user   a fixed width only (below), else measured each time
     The width never changes by itself while you search.
 
 nvemacs-notelist-tags-width           default nil
-    The tags width used when remember-widths is user.  Set it with
-    M-x nvemacs-notelist-widths-set.
+    A fixed tags width; set here, it wins over every other width.  Leave
+    it unset to have M-x nvemacs-notelist-widths-set keep a width in
+    settings.eld.  With a fixed width, C-c C-l lasts for the session only.
 
 nvemacs-show-selected-title           default t
     Show the selected note's title on the search line, as Notational
@@ -193,6 +198,21 @@ nvemacs-template-directory            default the templates/ folder shipped with
 
 nvemacs-new-note-extension            default "org"
     Extension of blank new notes (styles without :template).
+
+
+Search history
+--------------
+
+nvemacs-searchbar-history             default t (on while it is tested)
+    Record searches.  M-x nvemacs-searchbar-history turns it on or off and
+    remembers the choice in state.eld, which then wins over this value.
+    While it is off, the history file is deleted.
+
+nvemacs-searchbar-history-size        default 100
+    How many distinct searches are kept.  The oldest go first.
+
+nvemacs-searchbar-history-file        default nil = history.jsonl in the data directory
+    Where the history is kept.
 
 
 Tags

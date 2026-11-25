@@ -38,18 +38,19 @@ Installing
 
 nvEmacs is one file, nvemacs.el, with the templates/ folder beside it.
 
-Emacs 30 or later, straight from GitHub (use-package fetches it):
+Emacs 30 or later: put the following in your init file
+(~/.emacs.d/init.el).  The first time Emacs starts with it, use-package
+downloads nvEmacs from GitHub and installs it in ~/.emacs.d/elpa/.  Later
+starts use that copy and do not go online.
 
     (use-package nvemacs
       :vc (:url "https://github.com/tcharlesyun/nvemacs")
-      :custom (nvemacs-watched-directories '("~/notes/"))
       :bind ("<f8>" . nvemacs-searchbar-return))     ; suggested
 
 Emacs 29: M-x package-vc-install RET https://github.com/tcharlesyun/nvemacs
 RET, then in your init file:
 
     (require 'nvemacs)
-    (setq nvemacs-watched-directories '("~/notes/"))
     (global-set-key [f8] #'nvemacs-searchbar-return)   ; suggested
 
 By hand: download or clone the repository, and use the lines above with
@@ -57,6 +58,12 @@ By hand: download or clone the repository, and use the lines above with
     (add-to-list 'load-path "/path/to/nvemacs")
 
 before (require 'nvemacs).
+
+Watched folders.  The first time you run M-x nvemacs, it asks which
+folders hold your notes and keeps them in settings.eld, in its data folder.
+M-x nvemacs-index-folder-add and nvemacs-index-folder-remove change them
+later.  You may instead set nvemacs-watched-directories in your init file:
+that list is then used, and the two commands say to change it there.
 
 Loading.  Only M-x nvemacs loads nvEmacs by itself.  Before any other
 nvEmacs command is bound to a key, nvEmacs must be loaded: (require
@@ -78,9 +85,9 @@ file keeps Emacs from loading an old nvemacs.elc after an update.
 Getting started
 ---------------
 
-M-x nvemacs.  The first start builds the index (a few seconds per few
-thousand notes); later starts open it at once and bring it up to date in
-the background.
+M-x nvemacs.  The first start asks for your notes folders, then builds
+the index (a few seconds per few thousand notes); later starts open it at
+once and bring it up to date in the background.
 
 To try nvEmacs without touching your own notes, point it at a folder of
 copies, and keep its files apart from a later real setup:
@@ -465,7 +472,13 @@ and every file in it too: the index holds the text of every note.
   dates.eld       the Added date of every note.  Plain text.
                   Keep it: it cannot be rebuilt.  It may live elsewhere
                   (e.g. Dropbox) via nvemacs-dates-file.
-  state.eld       remembered values (the tags column width, the sort).
+  settings.eld    the choices you make in nvEmacs: the watched folders,
+                  a tags column width you set, comment search and search
+                  history on or off.  Keep it.
+  state.eld       remembered values (the tags column width from the last
+                  session, the sort).  Safe to delete.
+  history.jsonl   your recent searches, while search history is on.
+  malformed.org   the notes whose header needs attention.
   pending/        temp files holding the text of edits not yet written
                   to their notes.  Each is removed once its note is
                   written.
@@ -483,8 +496,9 @@ Your notes are written only when you save one, when you leave a note
 nvEmacs opened after changing its text or tags, and when nvEmacs exits
 (see "How edits are saved").  A new note closed untouched is moved to the
 system Trash, never deleted outright.  While a note has unwritten edits,
-Emacs keeps its usual .#name lock link beside it.  Preferences live in
-your init file or custom-file, never in the data directory.
+Emacs keeps its usual .#name lock link beside it.  nvEmacs never writes
+your init file or custom-file: a setting there wins over the choices
+nvEmacs keeps in settings.eld.
 
 
 Not built yet

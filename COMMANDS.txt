@@ -30,6 +30,8 @@ Keys in *nvEmacs*
                one, RET ends, C-g puts them back.
                                          (nvemacs-notelist-column-toggle)
   C-c C-c      Clear the search.         (nvemacs-searchbar-clear)
+  M-p / M-n    On the search line only: the previous or next search from
+               the history.  (nvemacs-searchbar-history-previous, -next)
   C-c C-n      New note titled with the search.  (nvemacs-note-new)
   C-c C-r      Rename the selected note.  (nvemacs-note-rename)
   C-c C-w      Move it to another watched folder.  (nvemacs-note-move)
@@ -135,13 +137,20 @@ Notes
 Searchbar and notelist
 
   nvemacs-searchbar-clear         Clear the search (C-c C-c).
+  nvemacs-searchbar-history       Turn search history on or off.  Off asks,
+                                  then deletes the history file.
+  nvemacs-searchbar-history-list  Show past searches in place of the
+                                  notelist.  Type to filter; on a row, RET
+                                  runs it, d deletes it, q returns.
+  nvemacs-searchbar-history-previous   The previous search (M-p).
+  nvemacs-searchbar-history-next       The next search (M-n).
   nvemacs-notelist-next           Next row (TAB).
   nvemacs-notelist-previous       Previous row (S-TAB).
   nvemacs-notelist-mouse-select   Select the clicked row (mouse-1).
   nvemacs-notelist-refresh        Fit the tags column and redraw (C-c C-l).
-  nvemacs-notelist-widths-set     Set the tags column width yourself; saved
-                                  through Customize, and the width setting
-                                  switches to `user' so it is kept.
+  nvemacs-notelist-widths-set     Set the tags column width yourself, kept
+                                  in settings.eld.  An empty answer measures
+                                  it again.
 
 Sorting and columns
 
@@ -194,6 +203,11 @@ Index
                                   dates.eld).
   nvemacs-index-skipped           List the notes that could not be indexed,
                                   and why (too large, binary, not UTF-8).
+  nvemacs-index-folder-add        Watch another folder, with its subfolders.
+                                  A missing folder can be created; a large
+                                  one (20,000 files or more) asks first.
+  nvemacs-index-folder-remove     Stop watching a folder.  Its notes leave
+                                  the index; the files are not touched.
   nvemacs-index-comments          Turn comment search on or off.  It asks,
                                   rebuilds the index, remembers the choice
                                   and says which state it is now in.
@@ -243,6 +257,7 @@ Search syntax
   -tag:old          leave out notes with a tag starting with "old"
   key:notes         notes with a key whose name starts with "notes"
   meta:whale        notes with "whale" in a key's value or a header comment
+  dir:work          notes in a folder starting with "work", and its subfolders
   created:2026-11   notes created in November 2026 (also added:, modified:)
   "key:string"      the literal text, not a prefix
 

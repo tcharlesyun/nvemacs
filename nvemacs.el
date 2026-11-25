@@ -4,7 +4,7 @@
 
 ;; Author: T. Charles Yun
 ;; Assisted-by: LLM/Claude Code (2026)
-;; Version: 0.0.4
+;; Version: 0.0.5
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: convenience, text, notes, Notational Velocity
 ;; URL: https://github.com/tcharlesyun/nvemacs
@@ -126,8 +126,12 @@ The two C primitives keep this cheap on a full rebuild."
   "Notational Velocity style note search."
   :group 'applications)
 
-(defcustom nvemacs-watched-directories '("~/notes/")
-  "Directories whose notes are indexed."
+(defcustom nvemacs-watched-directories nil
+  "Folders whose notes are indexed, with their subfolders.
+Leave this unset: nvEmacs asks for the folders at its first start and
+keeps them in settings.eld, and \[nvemacs-index-folder-add] and
+\[nvemacs-index-folder-remove] change them.  Set here, or with Customize,
+this list wins, and those commands say to change it here."
   :type '(repeat directory))
 
 (defcustom nvemacs-watched-directories-recursive t
@@ -1275,6 +1279,7 @@ collation."
                do (sqlite-execute db "INSERT INTO tags VALUES (?,?,?,?)"
                                   (list id (car tk) f (symbol-name (cdr tk)))))
       (nvemacs--insert-fields db id fields)
+      (nvemacs--dir-note-added db path)
       (dolist (pb problems)
         (sqlite-execute db "INSERT INTO problems VALUES (?,?,?,?)"
                         (list id (symbol-name (car pb)) (nth 1 pb) (nth 2 pb))))
@@ -1774,8 +1779,8 @@ of the two widths can differ (a title is at most 2 columns per char)."
                               "SELECT value FROM info WHERE key = 'search_comments'"))))
 
 (defun nvemacs--comments-restore ()
-  "Apply the choice `nvemacs-index-comments' saved in state.eld, if any."
-  (pcase (alist-get 'search-comments (nvemacs--state-read))
+  "Apply the choice `nvemacs-index-comments' kept in settings.eld, if any."
+  (pcase (nvemacs--setting 'search-comments)
     ('on (setq nvemacs-search-comments t))
     ('off (setq nvemacs-search-comments nil))))
 
@@ -1991,6 +1996,7 @@ A logging failure is reported and never stops nvEmacs."
 Not from a batch Emacs: tests and scripts let-bind the data directory,
 and at exit only the global default (~/.emacs.d/nvemacs/) is left."
   (unless noninteractive
+    (nvemacs--history-end 'quit)
     (when (get-buffer nvemacs--buffer-name)
       (nvemacs--widths-save)
       (nvemacs--homepage-save))
@@ -2419,7 +2425,7 @@ date that cannot be read."
        (let ((tg (replace-regexp-in-string
                   "\\`_+" "" (nvemacs--underscore v nvemacs--tag-chars))))
          (when (string-match-p "[^_]" tg) (nvemacs--fold tg))))
-      ((or 'key 'meta) (unless (string-empty-p v) (list kind text v)))
+      ((or 'key 'meta 'dir) (unless (string-empty-p v) (list kind text v)))
       (_ (unless (string-empty-p v)
            (let ((r (nvemacs--date-range v)))
              (if r (list kind text (car r) (cdr r)) (list 'bad text))))))))
@@ -2427,7 +2433,7 @@ date that cannot be read."
 (defun nvemacs--parse-query (query)
   "Split QUERY into (TERMS INCLUDE EXCLUDE).
 TERMS are the text terms, a quoted phrase being one term.  INCLUDE and
-EXCLUDE are the filters of the prefixes `tag:', `key:', `meta:',
+EXCLUDE are the filters of the prefixes `tag:', `key:', `meta:', `dir:',
 `created:', `added:' and `modified:', and of the same with `-' (see
 `nvemacs--query-item').  EXCLUDE also holds negated words, (word TEXT
 WORD).  A bare prefix or a lone `-' is ignored while it is being typed.
@@ -2436,7 +2442,7 @@ Any other colon, and anything quoted, is plain text."
     (setq nvemacs--query-bad nil)
     (dolist (tk (nvemacs--query-tokens query))
       (let ((tok (car tk)) (at (cdr tk)))
-        (if (and (string-match "\\`\\(-?\\)\\(tag\\|key\\|meta\\|created\\|added\\|modified\\):\\(.*\\)\\'" tok)
+        (if (and (string-match "\\`\\(-?\\)\\(tag\\|key\\|meta\\|dir\\|created\\|added\\|modified\\):\\(.*\\)\\'" tok)
                  (or (null at) (>= at (1+ (match-end 2)))))
             (let* ((neg (equal (match-string 1 tok) "-"))
                    (kind (intern (match-string 2 tok)))
@@ -2461,9 +2467,101 @@ Any other colon, and anything quoted, is plain text."
   "Return search filter ITEM as the user typed it."
   (if (stringp item) (concat "tag:" item) (nth 1 item)))
 
+(defvar nvemacs--dir-cache nil
+  "(DB . FOLDERS) for `dir:'.  See `nvemacs--dir-folders'.")
+
+(defun nvemacs--dir-folders ()
+  "Return every folder holding a note, as (FOLDER FOLDED START).
+FOLDER is as stored, ending in `/'; FOLDED is it folded for matching.
+START is where in FOLDED the watched folder's own name begins, so a
+partial name can be kept from matching a folder above it.  Reading every
+path takes ~95 ms on 42,460 notes, so the list is kept for this index
+and read again only when a note lands in a new folder
+\(`nvemacs--dir-note-added'), not on every save.  A folder left empty
+matches no note, so it can stay."
+  (let ((db (nvemacs--db)))
+    (unless (eq (car nvemacs--dir-cache) db)
+      (let ((roots (sort (mapcar (lambda (r) (cons r (length (nvemacs--fold
+                                                                (file-name-directory
+                                                                 (directory-file-name r))))))
+                                 (nvemacs--walk-roots))
+                         (lambda (a b) (> (length (car a)) (length (car b))))))
+            ;; In Lisp: SQLite's rtrim(path, ...) to drop filenames was 2.4x
+            ;; slower (213 ms against 89 ms on 42,460 notes, 2026-11-24).
+            (folders (let ((seen (make-hash-table :test #'equal)) (out nil))
+                       (dolist (r (sqlite-select db "SELECT path FROM meta") (nreverse out))
+                         (let ((f (file-name-directory (car r))))
+                           (unless (gethash f seen) (puthash f t seen) (push f out)))))))
+        (setq nvemacs--dir-cache
+              (cons db (cl-mapcar
+                                  (lambda (f folded)
+                                    (list f folded
+                                          (or (cdr (cl-find-if (lambda (r) (string-prefix-p (car r) f))
+                                                               roots))
+                                              (length folded))))
+                                  folders
+                                  ;; One fold for all: a temp buffer per folder costs more.
+                                  (and folders
+                                       (split-string (nvemacs--fold (mapconcat #'identity folders "\n"))
+                                                     "\n")))))))
+    (cdr nvemacs--dir-cache)))
+
+(defun nvemacs--dir-note-added (db path)
+  "Note PATH was indexed in DB: forget the folder list if PATH's folder is new."
+  (when (and (eq (car nvemacs--dir-cache) db)
+             (not (assoc (file-name-directory path) (cdr nvemacs--dir-cache))))
+    (setq nvemacs--dir-cache nil)))
+
+(defun nvemacs--dir-match-p (v folded start)
+  "Non-nil if `dir:V' matches a folder, FOLDED, with its watched name at START.
+A trailing `/' means whole names, which may be anywhere in the path.
+Otherwise the last part of V starts a folder name at or inside the
+watched folder, and any parts before it are the folders right above."
+  (let ((s (concat "/" v)))
+    (if (string-suffix-p "/" v)
+        (string-search s folded)
+      (let ((last (1+ (cl-position ?/ s :from-end t))) (from 0) (found nil) p)
+        (while (and (not found) (setq p (string-search s folded from)))
+          (when (>= (+ p last) start) (setq found t))
+          (setq from (1+ p)))
+        found))))
+
+(defun nvemacs--dir-anchor (v)
+  "Return `dir:V' as a folded full path when V starts with / or ~, else nil.
+The folders in it are resolved through symlinks, as stored paths are."
+  (when (string-match-p "\\`[/~]" v)
+    (let* ((whole (or (string-suffix-p "/" v) (member v '("~"))))
+           (full (expand-file-name v))
+           (dir (if whole (file-name-as-directory full) (file-name-directory full)))
+           (base (if whole "" (file-name-nondirectory full))))
+      (nvemacs--fold (concat (file-name-as-directory
+                              (if (file-directory-p dir) (file-truename dir) dir))
+                             base)))))
+
+(defun nvemacs--dir-condition (v)
+  "Return (CONDITION . ARGS) on `path' for the notes `dir:V' matches.
+Each matching folder is a range of paths, which covers its subfolders."
+  (let* ((anchor (nvemacs--dir-anchor v))
+         (hits (sort (cl-loop for (f folded start) in (nvemacs--dir-folders)
+                              when (if anchor
+                                       (string-prefix-p anchor folded)
+                                     (nvemacs--dir-match-p v folded start))
+                              collect f)
+                     #'string<))
+         (top nil))
+    ;; A folder inside one already listed adds nothing.
+    (dolist (f hits) (unless (and top (string-prefix-p (car top) f)) (push f top)))
+    (if (null top)
+        (cons "0" nil)
+      (cons (mapconcat (lambda (_) "(path >= ? AND path <= ?)") top " OR ")
+            (mapcan (lambda (f) (list f (concat f (string #x10FFFF)))) (nreverse top))))))
+
 (defun nvemacs--filter-parts (item)
   "Return (TABLE COLUMNS CONDITION . ARGS) for filter ITEM, not a tag."
   (pcase item
+    (`(dir ,_ ,v)
+     (let ((c (nvemacs--dir-condition v)))
+       `("meta" "path" ,(concat "(" (car c) ")") ,@(cdr c))))
     (`(key ,_ ,v)
      ;; The highest character ends every name starting with V.
      `("fields" "fkey" "fkey >= ? AND fkey <= ?" ,v ,(concat v (string #x10FFFF))))
@@ -2665,6 +2763,8 @@ restores the search you typed."
     (define-key map (kbd "RET") #'nvemacs-note-open)
     (define-key map (kbd "C-o") #'nvemacs-note-open-other-window)
     (define-key map (kbd "C-c C-c") #'nvemacs-searchbar-clear)
+    (define-key map (kbd "M-p") #'nvemacs-searchbar-history-previous)
+    (define-key map (kbd "M-n") #'nvemacs-searchbar-history-next)
     (define-key map (kbd "C-c C-q") #'nvemacs-tags-edit) ; as in Org
     (define-key map (kbd "C-c C-]") #'nvemacs-quit)
     (define-key map (kbd "C-c C-g") #'nvemacs-index-refresh)
@@ -3056,6 +3156,8 @@ it (see `nvemacs--view-return')."
           (progn (nvemacs--restore-typed)
                  (goto-char nvemacs--query-start) (end-of-line)
                  (setq this-command #'ignore))
+        ;; Typing over a shown title is a new search.
+        (nvemacs--history-end 'new-search)
         (setq nvemacs--selected-title nil nvemacs--typed nil)
         (nvemacs--replace-query "")
         (goto-char nvemacs--query-start)))))
@@ -3069,10 +3171,12 @@ it (see `nvemacs--view-return')."
                           (lambda () (when (buffer-live-p buf)
                                        (with-current-buffer buf (nvemacs--search))))))))
 
-(defun nvemacs--after-change (beg _end _len)
+(defun nvemacs--after-change (beg end len)
   "Restart the debounce timer when the query changes.
-An `after-change-functions' entry: BEG is where the change starts."
+An `after-change-functions' entry: BEG and END are the new text, and LEN
+the length of the text it replaced.  The search history sees each edit."
   (when (and (not nvemacs--inhibit-search) (nvemacs--in-query-p beg))
+    (nvemacs--history-edit (< (- end beg) len))
     ;; A new search selects nothing: blank the pane at once, so a search
     ;; with no matches never sits beside an unrelated note.
     (nvemacs--clear-pane)
@@ -3171,12 +3275,15 @@ nil: no limit."
   "How the notelist tags width is kept between sessions.
 `last': saved on exit and on \\[nvemacs-notelist-refresh] into state.eld,
   used at the next start; `never': nothing saved, each start measures its
-  first screen; `user': always `nvemacs-notelist-tags-width' (set it with
-  `nvemacs-notelist-widths-set'); a refresh then lasts for the session only."
+  first screen; `user': a fixed width only, from `nvemacs-notelist-tags-width'
+  or `nvemacs-notelist-widths-set', else measured each time.  With a fixed
+  width, a refresh lasts for the session only."
   :type '(choice (const last) (const never) (const user)))
 
 (defcustom nvemacs-notelist-tags-width nil
-  "Tags column width used when `nvemacs-notelist-remember-widths' is `user'."
+  "A fixed tags column width.  Set here, it wins over every other width.
+Leave it unset to have \\[nvemacs-notelist-widths-set] keep a width in
+settings.eld instead."
   :type '(choice (const :tag "Measure" nil) integer))
 
 (defcustom nvemacs-state-file nil
@@ -3375,14 +3482,68 @@ That is `nvemacs-state-file', or state.eld in `nvemacs-data-directory'."
       (insert "\n")
       (nvemacs--write-file f))))
 
+(defcustom nvemacs-settings-file nil
+  "Choices made in nvEmacs (settings.eld); nil = in `nvemacs-data-directory'.
+Unlike state.eld, keep this file: it holds the watched folders."
+  :type '(choice (const nil) file))
+
+(defun nvemacs--settings-file ()
+  "Return the path of settings.eld.
+nvEmacs keeps the choices made in it there, never in the init file."
+  (or nvemacs-settings-file (expand-file-name "settings.eld" nvemacs-data-directory)))
+
+(defun nvemacs--settings-read ()
+  "The alist in settings.eld, or nil (missing or unreadable)."
+  (let ((f (nvemacs--settings-file)))
+    (when (file-readable-p f)
+      (ignore-errors
+        (with-temp-buffer (insert-file-contents f) (read (current-buffer)))))))
+
+(defconst nvemacs--settings-moved '(search-comments search-history)
+  "Keys that versions before settings.eld kept in state.eld.
+Only these are looked for there: state.eld's `tags-width' is the width
+remembered from the last session, not a width the user chose.")
+
+(defun nvemacs--setting (key)
+  "The value kept for KEY in settings.eld.
+A key in `nvemacs--settings-moved' is also looked for in state.eld."
+  (let ((kept (assq key (nvemacs--settings-read))))
+    (cond (kept (cdr kept))
+          ((memq key nvemacs--settings-moved) (alist-get key (nvemacs--state-read))))))
+
+(defun nvemacs--setting-put (key value)
+  "Keep VALUE for KEY in settings.eld; nil removes KEY.
+An old copy of a moved key in state.eld is removed, so it cannot come back."
+  (let* ((f (nvemacs--settings-file))
+         (rest (assq-delete-all key (nvemacs--settings-read)))
+         (all (if value (cons (cons key value) rest) rest)))
+    (nvemacs--private-directory (file-name-directory f))
+    (with-temp-buffer
+      (insert ";; nvEmacs settings: the choices made in nvEmacs (written by nvEmacs).\n"
+              ";; Keep this file: it holds your watched folders.\n")
+      (let ((print-escape-newlines t)) (prin1 all (current-buffer)))
+      (insert "\n")
+      (nvemacs--write-file f)))
+  (when (memq key nvemacs--settings-moved)
+    (let ((st (nvemacs--state-read)))
+      (when (assq key st) (nvemacs--state-write (assq-delete-all key st))))))
+
+(defun nvemacs--width-fixed ()
+  "The fixed tags width, or nil.
+A width set in the init file wins, then one chosen with
+`nvemacs-notelist-widths-set'."
+  (or (and (integerp nvemacs-notelist-tags-width) (> nvemacs-notelist-tags-width 0)
+           nvemacs-notelist-tags-width)
+      (let ((w (nvemacs--setting 'tags-width))) (and (integerp w) (> w 0) w))))
+
 (defun nvemacs--widths-start ()
-  "Tags width for a new notelist, per `nvemacs-notelist-remember-widths'."
+  "Tags width for a new notelist: a fixed width, else per
+`nvemacs-notelist-remember-widths'."
   (setq nvemacs--tags-width
-        (pcase nvemacs-notelist-remember-widths
-          ('last (let ((w (alist-get 'tags-width (nvemacs--state-read))))
-                   (and (integerp w) (> w 0) w)))
-          ('user nvemacs-notelist-tags-width)
-          (_ nil))))
+        (or (nvemacs--width-fixed)
+            (and (eq nvemacs-notelist-remember-widths 'last)
+                 (let ((w (alist-get 'tags-width (nvemacs--state-read))))
+                   (and (integerp w) (> w 0) w))))))
 
 (defun nvemacs--widths-save ()
   "Remember the tags width when the mode is `last'."
@@ -3412,35 +3573,50 @@ jumps to the first row)."
 (defun nvemacs-notelist-refresh ()
   "Fit the tags column to every row shown so far and redraw in place.
 Saved for the next start when `nvemacs-notelist-remember-widths' is
-`last'; with `user' it lasts for this session only."
+`last'.  With a fixed width (`nvemacs-notelist-widths-set'), it lasts for
+this session only."
   (interactive)
   (with-current-buffer nvemacs--buffer-name
     (setq nvemacs--tags-width (nvemacs--measure-tags nvemacs--shown))
     (nvemacs--notelist-redraw)
-    (pcase nvemacs-notelist-remember-widths
-      ('last (nvemacs--widths-save)
-             (message "nvEmacs: tags column %d (saved)" nvemacs--tags-width))
-      ('user (message "nvEmacs: tags column %d for this session; not saved (M-x nvemacs-notelist-widths-set to keep)"
-                      nvemacs--tags-width))
-      (_ (message "nvEmacs: tags column %d (not saved)" nvemacs--tags-width)))))
+    (cond
+     ((or (nvemacs--width-fixed) (eq nvemacs-notelist-remember-widths 'user))
+      (message "nvEmacs: tags column %d for this session; not saved (M-x nvemacs-notelist-widths-set to keep)"
+               nvemacs--tags-width))
+     ((eq nvemacs-notelist-remember-widths 'last)
+      (nvemacs--widths-save)
+      (message "nvEmacs: tags column %d (saved)" nvemacs--tags-width))
+     (t (message "nvEmacs: tags column %d (not saved)" nvemacs--tags-width)))))
 
-(declare-function custom-file "cus-edit" (&optional no-error))
 
 (defun nvemacs-notelist-widths-set (width)
-  "Set the notelist tags column to WIDTH columns, and save that.
-The width is saved in your Customize file, with
-`nvemacs-notelist-remember-widths' set to `user', and applied at once."
-  (interactive (list (read-number "Notelist tags column width: " (or nvemacs--tags-width 30))))
-  (require 'cus-edit)
-  (let ((saving (custom-file t)))      ; nil under emacs -q: Customize cannot save
-    (customize-save-variable 'nvemacs-notelist-tags-width width)
-    (customize-save-variable 'nvemacs-notelist-remember-widths 'user)
-    (setq nvemacs--tags-width width)
-    (when (get-buffer nvemacs--buffer-name)
-      (with-current-buffer nvemacs--buffer-name (nvemacs--notelist-redraw)))
-    (message (if saving "nvEmacs: tags column %d, saved as your setting"
-               "nvEmacs: tags column %d for this session; NOT saved (Emacs started with -q, no init file)")
-             width)))
+  "Set the notelist tags column to WIDTH columns, and keep it.
+The width is kept in settings.eld in `nvemacs-data-directory', never in
+the init file.  An empty answer (WIDTH nil) measures the column again
+and stops keeping a width.  A width set in the init file wins: change it
+there."
+  (interactive
+   (let ((s (string-trim (read-string "Notelist tags column width (empty: measure it): "
+                                      (and nvemacs--tags-width (number-to-string nvemacs--tags-width))))))
+     (list (and (not (string-empty-p s)) (string-to-number s)))))
+  (when (integerp nvemacs-notelist-tags-width)
+    (nvemacs--command-error
+     'nvemacs-notelist-widths-set
+     (format "requires a width nvEmacs keeps, and nvemacs-notelist-tags-width is %d in your init file or custom-file"
+             nvemacs-notelist-tags-width)
+     "Change it there, or delete that setting so nvEmacs can keep the width"))
+  (when (and width (not (and (integerp width) (> width 0))))
+    (nvemacs--command-error 'nvemacs-notelist-widths-set
+                            "requires a whole number of columns above 0"
+                            "Re-run the command with a number, or empty to measure"))
+  (nvemacs--setting-put 'tags-width width)
+  (setq nvemacs--tags-width width)
+  (when (get-buffer nvemacs--buffer-name)
+    (with-current-buffer nvemacs--buffer-name
+      (if width (nvemacs--notelist-redraw) (nvemacs-notelist-refresh))))
+  (if width
+      (message "nvEmacs: tags column %d, kept in settings.eld" width)
+    (message "nvEmacs: tags column measured again")))
 
 (defun nvemacs--layout-now ()
   "The column layout rows drawn now in the current buffer's window get."
@@ -3718,8 +3894,12 @@ patched the same way; otherwise it is let go."
                   (format " · sorted by %s %s" (car nvemacs--sort) (nvemacs--sort-triangle)))))
   (force-mode-line-update))
 
+(defvar nvemacs--list-complete nil
+  "Non-nil once a list with no words shows every note it can.")
+
 (defun nvemacs--search ()
   "Run the current query in the current sort; the selection survives it."
+  (setq nvemacs--list-complete nil)
   (let* ((id (nvemacs--selection))
          (free nvemacs--view-free)
          (starts (and free (mapcar (lambda (w) (cons w (line-number-at-pos (window-start w))))
@@ -3772,6 +3952,7 @@ is pressed."
                                                        (car filter))
                                             (append (cdr filter) (list (max want before)))))))
             (funcall first-row)
+            (when (< (length nvemacs--shown) (max want before)) (setq nvemacs--list-complete t))
             (nvemacs--landing-status inc exc)
             (funcall record (if (or inc exc) "tags" "newest") (if kept "kept list" "listed"))))
       (let* ((route (nvemacs--route terms))
@@ -3993,6 +4174,7 @@ Return the number of rows added, or nil when there is nothing to do
           (if (> added 0)
               (progn (nvemacs--landing-status inc exc) added)
             (unless (or inc exc) (nvemacs--keep-list))   ; every note is listed
+            (setq nvemacs--list-complete t)
             nil)))))))
 
 (defconst nvemacs--grow-margin 3
@@ -4470,7 +4652,8 @@ puts back the columns it started with.  The title is always shown.
   (when (< (point) nvemacs--rows-start) (goto-char nvemacs--query-start) (end-of-line)))
 
 (defun nvemacs-searchbar-clear ()
-  "Clear the query."
+  "Clear the query.
+The search history sees the deleted text as a search cleared."
   (interactive)
   (setq nvemacs--selected-title nil nvemacs--typed nil nvemacs--selected-id nil)
   (nvemacs--view-free-set nil)
@@ -4546,6 +4729,9 @@ the search you typed."
 
 (defconst nvemacs--placeholder-name "*nvEmacs: no note*")
 (defconst nvemacs--homepage-name "*nvEmacs home*")
+(defconst nvemacs--history-name "*nvEmacs history*" "The search history view.")
+(defconst nvemacs--history-entry-name "*nvEmacs history entry*"
+  "The note pane's view of one history entry.")
 (defvar-local nvemacs--previewed nil "Path last shown in the note pane.")
 (defvar-local nvemacs--preview-timer nil)
 (defvar-local nvemacs--owned nil
@@ -4819,6 +5005,7 @@ nothing matches, create a note named after the search."
 
 (defun nvemacs--open-path (path)
   "Show PATH in the note pane with the cursor in it, or take the frame."
+  (nvemacs--history-end 'opened)
   (if (nvemacs--note-window)
       (nvemacs--show-in-pane path t)
     (nvemacs--set-fparam 'nvemacs-homepage-up nil)
@@ -4843,6 +5030,7 @@ again on `nvemacs-searchbar-return' or when the note is killed.  With
                                            "requires a note to open, and none is listed"
                                            "Change the search and then re-run the command")))
      (t
+      (nvemacs--history-end 'opened)
       (unless (nvemacs--note-window)
         (nvemacs--set-fparam 'nvemacs-temp t)
         (nvemacs--apply-layout))
@@ -4998,7 +5186,7 @@ arrangement is reset when nvEmacs quits."
 (defun nvemacs-index-comments ()
   "Turn comment search on or off, and say which it now is.
 Comments are in the index or not, so this asks, then rebuilds the index.
-The choice is kept in state.eld and survives a restart.  Answering no
+The choice is kept in settings.eld and survives a restart.  Answering no
 changes nothing."
   (interactive)
   (nvemacs--require-sqlite)
@@ -5009,17 +5197,15 @@ changes nothing."
     (if (not (y-or-n-p (format "Turn comment search %s and rebuild the index? "
                                (funcall word new))))
         (message "nvEmacs: comment search stays %s" (funcall word on))
-      (let ((saved (assq 'search-comments (nvemacs--state-read)))
+      (let ((saved (nvemacs--setting 'search-comments))
             (before nvemacs-search-comments)
             (done nil))
-        (nvemacs--state-write (cons (cons 'search-comments (if new 'on 'off))
-                                    (assq-delete-all 'search-comments (nvemacs--state-read))))
+        (nvemacs--setting-put 'search-comments (if new 'on 'off))
         (unwind-protect
             (progn (nvemacs-index-rebuild) (setq done t))
           ;; A rebuild that stopped must not leave a choice it did not apply.
           (unless done
-            (nvemacs--state-write (append (and saved (list saved))
-                                          (assq-delete-all 'search-comments (nvemacs--state-read))))
+            (nvemacs--setting-put 'search-comments saved)
             (setq nvemacs-search-comments before))))
       ;; Previews change with comments, and a rebuild restarts the generation.
       (nvemacs--kept-drop)
@@ -5071,12 +5257,14 @@ nvEmacs from every note buffer.  Then leave every frame nvEmacs owns,
 and close the placeholder and the unmodified notes nvEmacs opened
 \(killing nvEmacs must not leave every previewed note open)."
   (dolist (tm (list nvemacs--timer nvemacs--preview-timer)) (when tm (cancel-timer tm)))
+  (nvemacs--history-end 'quit)
   (nvemacs--grow-disable)
   (nvemacs--widths-save)
   (nvemacs--session-end)
   ;; Helper lists show nvEmacs state; stale once it is gone. The report stays: it may be kept to compare.
   (dolist (f (frame-list)) (set-frame-parameter f 'nvemacs-homepage-up nil))
-  (dolist (b (list "*nvEmacs tags*" "*nvEmacs skipped*" nvemacs--homepage-name))
+  (dolist (b (list "*nvEmacs tags*" "*nvEmacs skipped*" "*nvEmacs keys*" nvemacs--homepage-name
+                  nvemacs--history-name nvemacs--history-entry-name))
     (when (get-buffer b) (kill-buffer b)))
   (nvemacs--kept-drop)
   (when nvemacs-auto-save-interval (nvemacs--commit-all))
@@ -5253,6 +5441,7 @@ it once modified), and one closed as it started, its typing undone,
 goes to the Trash."
   (interactive (list (string-trim (with-current-buffer nvemacs--buffer-name
                                     (nvemacs--search-text)))))
+  (nvemacs--history-end 'opened)
   (let* ((style (alist-get nvemacs-new-note-naming-style-default nvemacs-new-note-naming-styles))
          (time (nvemacs--clock))
          (tname (plist-get style :template))
@@ -5374,7 +5563,9 @@ until the note is saved, or for recovery at the next start."
       (add-hook 'after-save-hook #'nvemacs--pending-delete nil t))))
 
 (defun nvemacs--first-change ()
-  "Remember this note as it was; run by `first-change-hook'."
+  "Remember this note as it was; run by `first-change-hook'.
+An edit in a note ends the search in progress, as opening it would."
+  (nvemacs--history-end 'opened)
   (when (and nvemacs-auto-save-interval buffer-file-name
              ;; Renamed in Emacs 31; nvEmacs supports 29 and up.
              (not (symbol-value (if (boundp 'revert-buffer-in-progress)
@@ -6114,6 +6305,443 @@ cursor leaves the note or its row."
       (goto-char (point-min))
       (pop-to-buffer (current-buffer)))))
 
+;;;; Search history
+;;
+;; Each search is recorded once, when it ends.  A search starts at the first
+;; edit after the last one ended.  Adding text extends it.  Deleting within
+;; a second of the last edit fixes a typo; deleting after a pause ends it
+;; and starts a new one.  It also ends when a note is opened or edited, the
+;; search line is cleared, or nvEmacs or Emacs exits.  The design is in the
+;; project's search_history notes.
+
+(defcustom nvemacs-searchbar-history t
+  "Non-nil means searches are recorded in `nvemacs-searchbar-history-file'.
+On by default while the feature is tested.
+\\[nvemacs-searchbar-history] turns it on or off and keeps the
+choice in settings.eld, where it wins over this value.  While it is
+off, the file is deleted."
+  :type 'boolean)
+
+(defcustom nvemacs-searchbar-history-size 100
+  "How many distinct searches the history keeps.  The oldest go first."
+  :type 'integer)
+
+(defcustom nvemacs-searchbar-history-file nil
+  "File of the search history.
+nil means history.jsonl in `nvemacs-data-directory'."
+  :type '(choice (const nil) file))
+
+(defface nvemacs-history-gutter
+  '((((background dark)) :background "#2f5d7c")
+    (t :background "#a9cce3"))
+  "The bar down the left of the history view, so it is not taken for the notelist.")
+
+(defconst nvemacs--history-pause 1.0
+  "Seconds after the last edit after which deleting starts a new search.
+Sooner, a deletion fixes a typo.")
+
+(defvar nvemacs--history-pending nil
+  "The search in progress: (QUERY START LAST-EDIT), times in seconds.")
+
+(defvar nvemacs--history-recall nil
+  "While stepping with M-p and M-n: (INDEX SAVED ENTRIES TYPED).
+INDEX is -1 on the text typed before; SAVED the search then in progress;
+ENTRIES the history, newest first, read once so it does not reorder.")
+
+(defun nvemacs--history-now ()
+  "The time now, in seconds."
+  (float-time))
+
+(defun nvemacs--history-file ()
+  "Return the path of the history file."
+  (or nvemacs-searchbar-history-file (expand-file-name "history.jsonl" nvemacs-data-directory)))
+
+(defun nvemacs--history-on-p ()
+  "Non-nil if searches are recorded."
+  nvemacs-searchbar-history)
+
+(defun nvemacs--history-size (&optional quiet)
+  "Return the history's limit.
+An unusable value gives 100, and says so unless QUIET."
+  (let ((n nvemacs-searchbar-history-size))
+    (if (and (integerp n) (> n 0))
+        n
+      (unless quiet
+        (nvemacs--command-message
+         'nvemacs-searchbar-history
+         (format "requires nvemacs-searchbar-history-size to be 1 or more, and it is %S" n)
+         "Set it to a whole number of searches; 100 is used until then"))
+      100)))
+
+(defun nvemacs--history-key (query)
+  "QUERY as compared for repeats: trimmed, spaces collapsed, folded."
+  (string-trim (replace-regexp-in-string "[ \t\n]+" " " (nvemacs--fold query))))
+
+(defun nvemacs--history-read ()
+  "Return the history's entries, oldest first, each an alist.
+The first line describes the file; a line that is not an entry is passed over."
+  (let ((f (nvemacs--history-file)) (out nil))
+    (when (file-readable-p f)
+      (with-temp-buffer
+        (let ((coding-system-for-read 'utf-8)) (insert-file-contents f))
+        (dolist (line (split-string (buffer-string) "\n" t))
+          (let ((e (ignore-errors (json-parse-string line :object-type 'alist
+                                                     :false-object :false :null-object nil))))
+            (when (and (consp e) (stringp (alist-get 'query e)))
+              (push e out))))))
+    (nreverse out)))
+
+(defvar nvemacs-version)
+
+(defun nvemacs--history-write (entries)
+  "Write ENTRIES, oldest first, as the history file: readable by its owner only."
+  (let ((f (nvemacs--history-file)))
+    (nvemacs--private-directory (file-name-directory f))
+    (with-temp-buffer
+      (insert (json-serialize `((about . "nvEmacs search history")
+                                (version . ,(or nvemacs-version "unknown"))
+                                (format . 1)))
+              "\n")
+      (dolist (e entries) (insert (json-serialize e) "\n"))
+      (nvemacs--write-file f))))
+
+(defun nvemacs--history-complete-p ()
+  "Non-nil if the list shows every match of its search."
+  (or nvemacs--list-complete
+      (and nvemacs--sort-keys (null nvemacs--rest) (not nvemacs--list-stale))))
+
+(defun nvemacs--history-record (pending how)
+  "Write search PENDING, ended HOW, to the history.
+A search already there moves to the end, its count one higher.  A write
+that fails says so; the search itself is not affected."
+  (when (and pending (nvemacs--history-on-p))
+    (condition-case err
+        (let* ((query (car pending))
+               (key (nvemacs--history-key query))
+               (entries (nvemacs--history-read))
+               (old (cl-find-if (lambda (e) (equal (nvemacs--history-key (alist-get 'query e)) key))
+                                entries))
+               (when (format-time-string "%FT%T%:z" (nth 1 pending)))
+               (buf (get-buffer nvemacs--buffer-name))
+               (shown (if buf (with-current-buffer buf (length nvemacs--shown)) 0))
+               (all (and buf (with-current-buffer buf (nvemacs--history-complete-p))))
+               (entry `((query . ,query) (when . ,when)
+                        (first . ,(or (alist-get 'first old) when))
+                        (count . ,(1+ (or (alist-get 'count old) 0)))
+                        (ended . ,(symbol-name how))
+                        (shown . ,shown) (all . ,(if all t :false))
+                        (notes . ,(or (ignore-errors (nvemacs--note-count)) 0))))
+               (size (nvemacs--history-size)))
+          (setq entries (append (remq old entries) (list entry)))
+          (when (> (length entries) size) (setq entries (last entries size)))
+          (nvemacs--history-write entries))
+      (error
+       (nvemacs--command-message
+        "The search history"
+        (format "requires a file it can write, and %s could not be written: %s"
+                (nvemacs--short-path (nvemacs--history-file)) (nvemacs--error-reason err))
+        "Check that folder, or set nvemacs-searchbar-history-file")))))
+
+(defun nvemacs--history-end (how)
+  "End the search in progress, recorded as ended HOW: `opened', `new-search',
+`cleared' or `quit'.  A search left for one recalled with M-p is recorded
+as replaced by a new search."
+  (let ((r nvemacs--history-recall) (p nvemacs--history-pending))
+    (setq nvemacs--history-recall nil nvemacs--history-pending nil)
+    (when (and r (>= (car r) 0)) (nvemacs--history-record (nth 1 r) 'new-search))
+    (nvemacs--history-record p how)))
+
+(defun nvemacs--history-begin (query)
+  "Make QUERY the search in progress, starting now."
+  (let ((now (nvemacs--history-now)))
+    (setq nvemacs--history-pending (list query now now))))
+
+(defun nvemacs--history-edit (deleting)
+  "The search line was edited; DELETING non-nil if text was removed.
+Extend the search in progress, end it, or start one."
+  (when (nvemacs--history-on-p)
+    (let ((r nvemacs--history-recall))
+      ;; Editing a recalled search keeps it: the one left for it ends now.
+      (when r
+        (setq nvemacs--history-recall nil)
+        (when (>= (car r) 0) (nvemacs--history-record (nth 1 r) 'new-search))))
+    (let ((q (string-trim (nvemacs--search-text)))
+          (now (nvemacs--history-now))
+          (p nvemacs--history-pending))
+      (cond
+       ((string-empty-p q) (when p (nvemacs--history-end 'cleared)))
+       ((null p) (nvemacs--history-begin q))
+       ((and deleting (>= (- now (nth 2 p)) nvemacs--history-pause))
+        (nvemacs--history-end 'new-search)
+        (nvemacs--history-begin q))
+       (t (setcar p q) (setcar (cddr p) now))))))
+
+(defun nvemacs--history-delete-file ()
+  "Delete the history file, if there is one."
+  (let ((f (nvemacs--history-file)))
+    (when (file-exists-p f) (delete-file f))))
+
+(defun nvemacs--history-start-session ()
+  "Apply the kept choice; with history off, delete any file left."
+  (pcase (nvemacs--setting 'search-history)
+    ('on (setq nvemacs-searchbar-history t))
+    ('off (setq nvemacs-searchbar-history nil)))
+  (unless (nvemacs--history-on-p)
+    (ignore-errors (nvemacs--history-delete-file))))
+
+(defun nvemacs-searchbar-history ()
+  "Turn search history on or off, and say which it now is.
+Turning it off asks first, then deletes the history file.  The choice is
+kept in settings.eld and survives a restart."
+  (interactive)
+  (pcase (nvemacs--setting 'search-history)
+    ('on (setq nvemacs-searchbar-history t))
+    ('off (setq nvemacs-searchbar-history nil)))
+  (let ((save (lambda (v) (nvemacs--setting-put 'search-history v))))
+    (if (not (nvemacs--history-on-p))
+        (progn (setq nvemacs-searchbar-history t)
+               (funcall save 'on)
+               (message "nvEmacs: search history is on"))
+      (let ((n (length (nvemacs--history-read))))
+        (if (not (y-or-n-p (format "Turn search history off and delete its %d search%s? "
+                                   n (if (= n 1) "" "es"))))
+            (message "nvEmacs: search history stays on")
+          (setq nvemacs-searchbar-history nil
+                nvemacs--history-pending nil nvemacs--history-recall nil)
+          (funcall save 'off)
+          (nvemacs--history-delete-file)
+          (dolist (b (list nvemacs--history-name nvemacs--history-entry-name))
+            (when (get-buffer b) (kill-buffer b)))
+          (message "nvEmacs: search history is off"))))))
+
+;;; Recall with M-p and M-n
+
+(defun nvemacs--history-recall-step (delta command)
+  "Show the search DELTA steps older in the history, for COMMAND.
+Stepping records nothing: the search shown is recorded when it ends."
+  (unless (and (derived-mode-p 'nvemacs-mode) (nvemacs--on-search-line-p))
+    (nvemacs--command-error command "works only on the search line"
+                            "Move to the search line and then re-run the command"))
+  (unless nvemacs--history-recall
+    (setq nvemacs--history-recall
+          (list -1 nvemacs--history-pending (reverse (nvemacs--history-read)) (nvemacs--query))))
+  (let* ((r nvemacs--history-recall)
+         (entries (nth 2 r))
+         (i (+ (car r) delta)))
+    (cond
+     ((null entries) (message "nvEmacs: no searches in the history yet"))
+     ((>= i (length entries)) (message "nvEmacs: no older search"))
+     ((< i -1) (message "nvEmacs: no newer search"))
+     (t
+      (setcar r i)
+      (if (< i 0)
+          (progn (nvemacs--replace-query (nth 3 r))
+                 (setq nvemacs--history-pending (nth 1 r)))
+        (let ((q (alist-get 'query (nth i entries))))
+          (nvemacs--replace-query q)
+          (nvemacs--history-begin q)))
+      (goto-char nvemacs--query-start)
+      (end-of-line)
+      (nvemacs--clear-pane)
+      (nvemacs--schedule-search)))))
+
+(defun nvemacs-searchbar-history-previous ()
+  "Put the previous search from the history on the search line.
+Only on the search line: elsewhere M-p keeps its usual meaning."
+  (interactive)
+  (nvemacs--history-recall-step 1 'nvemacs-searchbar-history-previous))
+
+(defun nvemacs-searchbar-history-next ()
+  "Put the next search from the history on the search line, or the text
+typed before stepping back."
+  (interactive)
+  (nvemacs--history-recall-step -1 'nvemacs-searchbar-history-next))
+
+;;; The history view
+
+(defvar nvemacs--history-row-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "d") #'nvemacs--history-delete)
+    (define-key map (kbd "q") #'nvemacs--history-leave)
+    map)
+  "Keys on a row of the history view.")
+
+(defvar nvemacs-searchbar-history-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'nvemacs--history-run)
+    (define-key map (kbd "C-c C-c") #'nvemacs--history-leave)
+    (define-key map (kbd "TAB") #'forward-line)
+    map)
+  "Keys of the history view.")
+
+(defvar-local nvemacs--history-filter-start nil "Where the history's filter text starts.")
+(defvar-local nvemacs--history-rows-start nil "Where the history's rows start.")
+
+(define-derived-mode nvemacs-searchbar-history-mode fundamental-mode "nvEmacs-History"
+  "Past searches, newest first.  Type to filter them; RET runs one.
+\\{nvemacs-searchbar-history-mode-map}"
+  (setq-local truncate-lines t)
+  (setq-local buffer-undo-list t)
+  ;; A colored bar down the left, so this is never taken for the notelist.
+  (setq-local line-prefix (propertize "  " 'face 'nvemacs-history-gutter))
+  (setq-local wrap-prefix line-prefix)
+  (add-hook 'after-change-functions #'nvemacs--history-filtered nil t)
+  (add-hook 'pre-command-hook #'nvemacs--history-pre-command nil t)
+  (add-hook 'post-command-hook #'nvemacs--history-show-entry nil t))
+
+(defun nvemacs--history-buffer ()
+  "Return the history view, made if needed."
+  (or (get-buffer nvemacs--history-name)
+      (with-current-buffer (get-buffer-create nvemacs--history-name)
+        (nvemacs-searchbar-history-mode)
+        (let ((inhibit-read-only t))
+          (insert (propertize "History: " 'read-only t 'front-sticky t 'rear-nonsticky t
+                              'field 'prompt 'face 'minibuffer-prompt))
+          (setq nvemacs--history-filter-start (point-marker))
+          (insert (propertize "\n" 'read-only t))
+          (setq nvemacs--history-rows-start (point-marker)))
+        (current-buffer))))
+
+(defun nvemacs--history-filter-text ()
+  "The text typed on the history view's filter line."
+  (buffer-substring-no-properties nvemacs--history-filter-start
+                                  (save-excursion (goto-char nvemacs--history-filter-start)
+                                                  (line-end-position))))
+
+(defun nvemacs--history-matcher (text)
+  "Return a predicate on a folded query, for filter TEXT.
+Words, quoted phrases and -word work as in search, as plain text: a
+prefix such as dir: is matched as written."
+  (let (want skip)
+    (dolist (tk (nvemacs--query-tokens text))
+      (let ((tok (car tk)) (at (cdr tk)))
+        (if (and (string-prefix-p "-" tok) (not (eql at 0)) (> (length tok) 1)
+                 (or (eql at 1) (string-match-p "\\`-[[:alnum:]]" tok)))
+            (push (substring tok 1) skip)
+          (unless (equal tok "-") (push tok want)))))
+    (lambda (q)
+      (and (cl-every (lambda (w) (string-search w q)) want)
+           (not (cl-some (lambda (w) (string-search w q)) skip))))))
+
+(defun nvemacs--history-row (e)
+  "Return the history view's line for entry E."
+  (let ((when (or (alist-get 'when e) ""))
+        (count (or (alist-get 'count e) 1)))
+    (propertize
+     (format "%-16s  %-4s  %-10s  %-5s  %s\n"
+             (string-replace "T" " " (substring when 0 (min 16 (length when))))
+             (if (> count 1) (format "×%d" count) "")
+             (or (alist-get 'ended e) "")
+             (format "%s%s" (or (alist-get 'shown e) 0) (if (eq (alist-get 'all e) t) "" "+"))
+             (alist-get 'query e))
+     'read-only t 'nvemacs-history e 'keymap nvemacs--history-row-map)))
+
+(defun nvemacs--history-render ()
+  "Draw the rows that match the filter, newest first."
+  (let* ((entries (reverse (nvemacs--history-read)))
+         (match (nvemacs--history-matcher (nvemacs--history-filter-text)))
+         (inhibit-read-only t)
+         (shown 0))
+    (save-excursion
+      (delete-region nvemacs--history-rows-start (point-max))
+      (goto-char (point-max))
+      (dolist (e entries)
+        (when (funcall match (nvemacs--history-key (alist-get 'query e)))
+          (setq shown (1+ shown))
+          (insert (nvemacs--history-row e)))))
+    (setq header-line-format
+          (if (nvemacs--history-on-p)
+              (format " nvEmacs history · %d/%d searches%s · q returns"
+                      (length entries) (nvemacs--history-size t)
+                      (if (= shown (length entries)) "" (format " · %d shown" shown)))
+            " nvEmacs history · off: M-x nvemacs-searchbar-history turns it on · q returns"))))
+
+(defun nvemacs--history-filtered (beg _end _len)
+  "Draw the rows again when the filter line is edited at BEG."
+  (when (and nvemacs--history-rows-start (< beg nvemacs--history-rows-start))
+    (nvemacs--history-render)))
+
+(defun nvemacs--history-pre-command ()
+  "Make typing on a row edit the filter line, as in the notelist."
+  (when (and (memq this-command nvemacs--typing-commands)
+             (>= (point) nvemacs--history-rows-start))
+    (goto-char nvemacs--history-filter-start)
+    (end-of-line)))
+
+(defun nvemacs--history-entry-at ()
+  "The entry on the line at point, or nil."
+  (get-text-property (line-beginning-position) 'nvemacs-history))
+
+(defun nvemacs--history-show-entry ()
+  "Show the entry at point in the note pane: no search is run."
+  (let ((e (nvemacs--history-entry-at)) (nw (nvemacs--note-window)))
+    (when (and e nw)
+      (with-current-buffer (get-buffer-create nvemacs--history-entry-name)
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (format "Search:      %s\n\nLast run:    %s\nFirst run:   %s\nTimes run:   %s\nEnded:       %s\nRows shown:  %s%s\nNotes then:  %s\n"
+                          (alist-get 'query e) (alist-get 'when e) (alist-get 'first e)
+                          (alist-get 'count e) (alist-get 'ended e) (alist-get 'shown e)
+                          (if (eq (alist-get 'all e) t) ", every match"
+                            ", with more matches not yet listed")
+                          (alist-get 'notes e))))
+        (setq buffer-read-only t))
+      (set-window-buffer nw nvemacs--history-entry-name))))
+
+(defun nvemacs-searchbar-history-list ()
+  "Show past searches in place of the notelist, newest first.
+Type to filter them, RET runs one, d deletes one, q returns."
+  (interactive)
+  (let ((buf (nvemacs--history-buffer)) (lw (nvemacs--list-window)))
+    (if lw (progn (set-window-buffer lw buf) (select-window lw)) (pop-to-buffer-same-window buf))
+    (with-current-buffer buf
+      (nvemacs--history-render)
+      (goto-char nvemacs--history-filter-start)
+      (end-of-line))))
+
+(defun nvemacs--history-leave ()
+  "Hide the history view and return to the notelist."
+  (interactive)
+  (if (get-buffer nvemacs--buffer-name)
+      (progn (set-window-buffer (selected-window) nvemacs--buffer-name)
+             (nvemacs--clear-pane)
+             (nvemacs--focus-query))
+    (quit-window)))
+
+(defun nvemacs--history-run ()
+  "Run the search on this row, or the newest shown from the filter line."
+  (interactive)
+  (let ((e (or (nvemacs--history-entry-at)
+               (and (< (point) nvemacs--history-rows-start)
+                    (get-text-property nvemacs--history-rows-start 'nvemacs-history)))))
+    (when e
+      (nvemacs--history-leave)
+      (with-current-buffer nvemacs--buffer-name
+        (let ((q (alist-get 'query e)))
+          (nvemacs--history-end 'new-search)
+          (setq nvemacs--selected-title nil nvemacs--typed nil nvemacs--selected-id nil)
+          (nvemacs--view-free-set nil)
+          (nvemacs--replace-query q)
+          (nvemacs--history-begin q)
+          (goto-char nvemacs--query-start)
+          (end-of-line)
+          (nvemacs--search))))))
+
+(defun nvemacs--history-delete ()
+  "Delete the search on this row from the history."
+  (interactive)
+  (let ((e (nvemacs--history-entry-at)))
+    (when e
+      (let ((key (nvemacs--history-key (alist-get 'query e)))
+            (line (line-number-at-pos)))
+        (nvemacs--history-write
+         (cl-remove-if (lambda (x) (equal (nvemacs--history-key (alist-get 'query x)) key))
+                       (nvemacs--history-read)))
+        (nvemacs--history-render)
+        (goto-char (point-min))
+        (forward-line (1- line))
+        (message "nvEmacs: deleted from the search history")))))
+
 ;;;; Malformed notes: the report file
 ;;
 ;; Title, Created, Date and file tags have a meaning, so nvEmacs can say
@@ -6233,6 +6861,154 @@ edits those notes."
     (with-current-buffer buf (setq buffer-read-only t))
     (pop-to-buffer buf)
     file))
+
+;;;; Watched folders
+;;
+;; nvEmacs keeps the watched folders in settings.eld and asks for them at
+;; its first start.  A list set in the init file wins instead, and the
+;; commands here then say to change it there: two places setting it, each
+;; winning some of the time, could not be explained.
+
+(defconst nvemacs--large-folder 20000
+  "Files in a folder being added at which nvEmacs warns that it is large.")
+
+(defvar nvemacs--folders-from-init nil
+  "Non-nil when the watched folders were set in the init file.")
+(defvar nvemacs--folders-kept nil
+  "The list nvEmacs set from settings.eld, to tell it from an init-file value.")
+
+(defun nvemacs--folders-load ()
+  "Use the watched folders kept in settings.eld, unless the init file set some."
+  (if (and nvemacs-watched-directories
+           (not (equal nvemacs-watched-directories nvemacs--folders-kept)))
+      (setq nvemacs--folders-from-init t)
+    (setq nvemacs--folders-from-init nil
+          nvemacs-watched-directories (nvemacs--setting 'watched-folders)
+          nvemacs--folders-kept nvemacs-watched-directories)))
+
+(defun nvemacs--folders-check-own (command)
+  "Refuse COMMAND when the watched folders were set in the init file."
+  (when nvemacs--folders-from-init
+    (nvemacs--command-error
+     command
+     (concat "requires watched folders that nvEmacs keeps, and nvemacs-watched-directories "
+             "is set in your init file (by setq, use-package :custom or Customize)")
+     "Change the folders there, or delete that setting and restart Emacs so nvEmacs can keep them")))
+
+(defun nvemacs--folders-set (list)
+  "Make LIST the watched folders and keep it in settings.eld."
+  (setq nvemacs-watched-directories list nvemacs--folders-kept list)
+  (nvemacs--setting-put 'watched-folders list))
+
+(defun nvemacs--folders-applied ()
+  "Bring the index, and a running nvEmacs, up to date with the folders."
+  (when (or nvemacs--db (file-exists-p (nvemacs--index-path)))
+    (nvemacs-index-reconcile))
+  (when (get-buffer nvemacs--buffer-name)
+    (nvemacs--note-files)
+    (nvemacs--update-watches)
+    (with-current-buffer nvemacs--buffer-name (nvemacs--search))))
+
+(defun nvemacs--count-files (dir limit)
+  "Count the files in DIR and its subfolders, stopping at LIMIT.
+Only names are read: a name with an extension is taken as a file without
+asking the disk, which costs about 8 µs a name (437,264 in 3.4 s,
+measured 2026-11-24).  Hidden folders are skipped, as when indexing."
+  (let ((todo (list dir)) (n 0))
+    (catch 'full
+      (while todo
+        (let ((d (pop todo)))
+          (dolist (name (ignore-errors (directory-files d nil nil t)))
+            (cond ((member name '("." "..")))
+                  ((string-match-p nvemacs-ignore-dir-regexp name))
+                  ((string-match-p "\\.[^.]+\\'" name) (setq n (1+ n)))
+                  ((file-directory-p (expand-file-name name d))
+                   (when nvemacs-watched-directories-recursive
+                     (push (expand-file-name name d) todo)))
+                  (t (setq n (1+ n))))
+            (when (>= n limit) (throw 'full n))))))
+    n))
+
+(defun nvemacs--folder-add-1 (dir command)
+  "Add DIR to the watched folders for COMMAND, checking it with the user.
+Return non-nil if it was added."
+  (let* ((dir (file-name-as-directory (abbreviate-file-name (expand-file-name dir))))
+         (true (lambda (d) (file-name-as-directory (file-truename (expand-file-name d)))))
+         (said-no (lambda () (message "nvEmacs: %s not added" dir) nil)))
+    (if (and (not (file-directory-p dir))
+             (not (y-or-n-p (format "%s does not exist.  Create it? (n cancels, if it is a typo) " dir))))
+        (funcall said-no)
+      (unless (file-directory-p dir) (make-directory dir t))
+      (let* ((td (funcall true dir))
+             (covering (cl-find-if (lambda (w) (string-prefix-p (funcall true w) td))
+                                   nvemacs-watched-directories))
+             (inside (cl-remove-if-not (lambda (w) (string-prefix-p td (funcall true w)))
+                                       nvemacs-watched-directories)))
+        (cond
+         (covering
+          (nvemacs--command-error
+           command
+           (if (equal (funcall true covering) td)
+               (format "requires a folder not watched yet, and %s is already watched" dir)
+             (format "requires a folder not watched yet, and %s is inside the watched folder %s"
+                     dir covering))
+           "Choose another folder"))
+         ((and inside
+               (not (y-or-n-p (format "%s holds the watched folder%s %s.  Watch %s instead? "
+                                      dir (if (cdr inside) "s" "") (string-join inside ", ") dir))))
+          (funcall said-no))
+         ((and (>= (nvemacs--count-files td nvemacs--large-folder) nvemacs--large-folder)
+               (not (y-or-n-p (format "%s is a large folder (%s files or more), and indexing it may take a while.  Watch it anyway? "
+                                      dir (nvemacs--group-digits nvemacs--large-folder)))))
+          (funcall said-no))
+         (t (nvemacs--folders-set
+             (append (cl-remove-if (lambda (w) (member w inside)) nvemacs-watched-directories)
+                     (list dir)))
+            t))))))
+
+(defun nvemacs--folders-ask ()
+  "Ask for the watched folders, as at a first start with none.
+C-g stops asking; nvEmacs then starts with none, and its home page says
+how to add them."
+  (condition-case nil
+      (let ((more t))
+        (while more
+          (condition-case err
+              (nvemacs--folder-add-1 (read-directory-name "Folder of your notes: " nil nil nil) 'nvemacs)
+            (user-error (message "%s" (error-message-string err)) (sit-for 2)))
+          (setq more (y-or-n-p "Add another folder? "))))
+    (quit nil)))
+
+(defun nvemacs-index-folder-add (dir)
+  "Watch folder DIR and its subfolders, and index its notes.
+The list is kept in settings.eld.  A folder that does not exist can be
+created; one holding 20,000 files or more asks first."
+  (interactive
+   (progn (nvemacs--folders-load)
+          (nvemacs--folders-check-own 'nvemacs-index-folder-add)
+          (list (read-directory-name "Watch folder: "))))
+  (nvemacs--folders-load)
+  (nvemacs--folders-check-own 'nvemacs-index-folder-add)
+  (when (nvemacs--folder-add-1 dir 'nvemacs-index-folder-add)
+    (nvemacs--folders-applied)
+    (message "nvEmacs: now watching %s" (file-name-as-directory (abbreviate-file-name (expand-file-name dir))))))
+
+(defun nvemacs-index-folder-remove (dir)
+  "Stop watching folder DIR.  Its notes leave the index; its files stay.
+Their Added dates are kept, so watching the folder again restores them."
+  (interactive
+   (progn (nvemacs--folders-load)
+          (nvemacs--folders-check-own 'nvemacs-index-folder-remove)
+          (list (completing-read "Stop watching folder: " nvemacs-watched-directories nil t))))
+  (nvemacs--folders-load)
+  (nvemacs--folders-check-own 'nvemacs-index-folder-remove)
+  (unless (member dir nvemacs-watched-directories)
+    (nvemacs--command-error 'nvemacs-index-folder-remove
+                            (format "requires a watched folder, and %s is not one" dir)
+                            "Re-run the command and choose from the list"))
+  (nvemacs--folders-set (remove dir nvemacs-watched-directories))
+  (nvemacs--folders-applied)
+  (message "nvEmacs: no longer watching %s; its files are untouched" dir))
 
 ;;;; Keys
 
@@ -7002,6 +7778,10 @@ The table is in Markdown if MD."
       ("index-ready" . ,(nvemacs--homepage-times :ready-ms))
       ("malformed-file" . ,(nvemacs--malformed-file))
       ("malformed-count" . ,(nvemacs--malformed-summary))
+      ("history-state" . ,(if (nvemacs--history-on-p) "on" "off"))
+      ("history-count" . ,(format "%d/%d" (if (nvemacs--history-on-p) (length (nvemacs--history-read)) 0)
+                                  (nvemacs--history-size t)))
+      ("history-file" . ,(if (nvemacs--history-on-p) (nvemacs--history-file) "none"))
       ("recent" . ,(nvemacs--homepage-recent md))
       ("commands" . ,(nvemacs--homepage-commands md)))))
 
@@ -7083,8 +7863,7 @@ A crash skips the exit write, so none of this can be stored in it."
     (concat
      (when (or (null nvemacs-watched-directories) (zerop (nvemacs--note-count)))
        (concat h "Getting started\n\n"
-               "- Point nvEmacs at your notes: M-x customize-variable RET"
-               " nvemacs-watched-directories\n\n"))
+               "- Choose your notes folders: M-x nvemacs-index-folder-add\n\n"))
      (when attention
        (concat h "Needs attention\n\n"
                (mapconcat (lambda (a) (concat "- " a)) attention "\n") "\n\n"))
@@ -7257,6 +8036,10 @@ measured and logged (startup.jsonl)."
   (interactive)
   (nvemacs--require-sqlite)              ; before anything is created
   (nvemacs--comments-restore)            ; before an index may be built
+  (nvemacs--history-start-session)
+  (nvemacs--folders-load)
+  (when (and (null nvemacs-watched-directories) (not noninteractive))
+    (nvemacs--folders-ask))
   (let* ((t0 (float-time))
          (call-time (current-time))
          (rebuilt (unless (and (file-exists-p (nvemacs--index-path)) (nvemacs--index-current-p))
