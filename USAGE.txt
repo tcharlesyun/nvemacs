@@ -12,32 +12,36 @@ Simple search
   whale ishmael     notes containing both, anywhere, in any order
   "blue whale"      that exact phrase, even when a line break splits it
 
-Plain words search a note's title and body.  They do not search its
-header, keys or comments.
+A space means AND: a note must contain every word.  Plain words search a
+note's title and body.  They do not search its header, keys or comments.
+To leave words out, or to find one word or another, see Boolean search.
 
 
-Leaving notes out
------------------
+Boolean search
+--------------
 
-A minus sign in front of a word, a quoted phrase or a search prefix leaves
-those notes out.
+Boolean search combines words with AND, NOT and OR.
+
+AND is the space between words, as in simple search.  There is no AND
+keyword: a typed AND is searched as the word "and".
+
+  whale ishmael     notes with both "whale" and "ishmael"
+
+NOT is a minus sign in front of a word, a quoted phrase, a search prefix or
+a group.  It leaves those notes out.
 
   -whale            notes without "whale"
   -"blue whale"     notes without that phrase
   whale -ishmael    notes with "whale" but not "ishmael"
   -5                notes without "5"
-  -tag:old          leave out notes with a tag starting with "old"
-  -key:draft        leave out notes that have a key named "draft"
-  -meta:whale       leave out notes with "whale" in a key's value
-  -created:2026-11  leave out notes created in November 2026
-  -dir:archive      leave out notes in a folder starting with "archive"
+  -tag:old          notes without a tag starting with "old"
 
 A word follows the same rule as plain search: -whale looks at the title and
 body, not the header, keys or comments.
 
 The minus means NOT only at the start of a word, and only before a letter,
-digit or quote.  To search for text that starts with a hyphen, put it in
-quotes.  There is no backslash escape.
+digit, quote or opening parenthesis.  To search for text that starts with a
+hyphen, put it in quotes.  There is no backslash escape.
 
   "-whale"          the text -whale
   "-5"              the text -5
@@ -46,6 +50,54 @@ quotes.  There is no backslash escape.
   --verbose         the text --verbose: another hyphen follows the first
   ->                the text ->: a symbol follows the hyphen
   -                 ignored while you are still typing
+
+OR is a capital OR between the words of a group in parentheses.
+
+  (whale OR shark)          notes with "whale", "shark" or both
+  (whale OR shark) ocean    either one, and also "ocean"
+  ("blue whale" OR orca)    phrases too
+  (tag:work OR dir:work)    and every search prefix
+  -(whale OR shark)         notes with neither: the same as -whale -shark
+
+A lowercase or, and an OR outside parentheses, is searched as the word
+"or": this or that, this OR that, (this or that).
+
+Groups must be explicit.  A group is either all OR or all spaces, never
+both, so nothing depends on which one binds tighter:
+
+  (whale OR shark ocean)    not allowed: which two go together?
+  (whale OR (shark ocean))  whale, or shark with ocean
+  ((whale OR shark) ocean)  whale or shark, with ocean
+
+A minus before a group of words joined by spaces is not allowed either:
+
+  -(whale shark)            not allowed: leave out both, or notes with both?
+  -whale -shark             leave out every note with either word
+  (-whale OR -shark)        leave out only the notes with both
+
+Such a search does not run.  The list stays as it was, and the echo area
+says why.
+
+Two kinds of search run, with a warning in the echo area:
+
+  (whale OR -shark)         a minus inside OR matches almost every note:
+                            here, every note without "shark"
+  (whale AND shark)         AND is searched as the word "and"
+
+Parentheses group only at the edge of a word, so f(x) and :) are plain
+text.  A group left open runs to the end, so the list narrows while you
+type, and a trailing OR waits for its next word.  Quotes make parentheses
+and OR plain text:
+
+  "(1)"                     the text (1)
+  "(this OR that)"          that text, parentheses included
+
+With parentheses in the search, Return does not create a note when nothing
+matches: C-c C-n does, titled with the search.  Return opens nothing while
+the search has an empty group, such as -( with nothing after it yet.
+
+Each of these messages ends with a pointer here.  M-x nvemacs-usage shows
+this file in the note pane, at this section after one of them.
 
 
 Search prefixes
@@ -58,6 +110,8 @@ Search prefixes
   created: the note's Created date
   added:   the date nvEmacs first saw the file
   modified: the date the file last changed
+
+A minus before any prefix leaves those notes out, as -tag:old does.
 
 Any other word with a colon, such as http:, is plain text.  To search for
 text that looks like a prefix, put it in quotes:
@@ -77,6 +131,8 @@ shows them all.
   meta:whale        notes with "whale" in any key's value
   meta:"blue whale" notes with that phrase in any key's value
   key:"date created"  a key name with a space in it
+  -key:draft        leave out notes that have a key named "draft"
+  -meta:whale       leave out notes with "whale" in a key's value
 
 Be careful when combining the two:
 
@@ -150,6 +206,7 @@ are included, and a partial date means its whole span.
   created:2026-01-15~15        15 days either side: Dec 31 through Jan 30
   created:2027-01-01>1m        forward one month: Jan 1 through Feb 1, 2027
   created:2027-01-01<1m        back one month: Dec 1, 2026 through Jan 1, 2027
+  -created:2026-11             leave out notes created in November 2026
 
 A number with no unit takes the date's precision: days for a full date,
 months for 2026-11 and years for 2026.  A date that cannot be read, such as

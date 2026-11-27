@@ -107,6 +107,8 @@ Starting and leaving
                                   C-c ) in notes).
   nvemacs-quit                    Exit nvEmacs (C-c C-]).
   nvemacs-version                 Show the version of nvEmacs.
+  nvemacs-usage                   Show USAGE.txt, how to search, in the note
+                                  pane; the cursor stays on the search line.
   nvemacs-homepage-show          Show the home page, up to date.  On the
                                   page: RET opens a note, g refreshes,
                                   q returns to the search line.
@@ -255,6 +257,7 @@ Search syntax
   -whale            notes without "whale" ("-whale" is the literal text)
   tag:work          notes with a tag starting with "work"
   -tag:old          leave out notes with a tag starting with "old"
+  (whale OR shark)  either word: OR is capital, inside parentheses
   key:notes         notes with a key whose name starts with "notes"
   meta:whale        notes with "whale" in a key's value or a header comment
   dir:work          notes in a folder starting with "work", and its subfolders

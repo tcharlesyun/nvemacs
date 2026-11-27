@@ -65,11 +65,12 @@ M-x nvemacs-index-folder-add and nvemacs-index-folder-remove change them
 later.  You may instead set nvemacs-watched-directories in your init file:
 that list is then used, and the two commands say to change it there.
 
-Loading.  Only M-x nvemacs loads nvEmacs by itself.  Before any other
-nvEmacs command is bound to a key, nvEmacs must be loaded: (require
-'nvemacs) does it, and use-package's :bind arranges it.  Without either,
-F8 pressed before the first M-x nvemacs only says "Symbol's function
-definition is void: nvemacs-searchbar-return".
+Loading.  Installed with use-package :vc or package-vc-install, two
+commands load nvEmacs when first used: M-x nvemacs and
+nvemacs-searchbar-return (the suggested F8), so the F8 line needs no
+(require 'nvemacs).  The other commands work once nvEmacs is running.
+Installed by hand, Emacs knows neither until (require 'nvemacs) runs, so
+keep that line.
 
 Compiling.  use-package :vc and package-vc-install compile nvEmacs when
 they install it.  Installed by hand, compile it once, and again after each
@@ -474,7 +475,10 @@ and every file in it too: the index holds the text of every note.
                   (e.g. Dropbox) via nvemacs-dates-file.
   settings.eld    the choices you make in nvEmacs: the watched folders,
                   a tags column width you set, comment search and search
-                  history on or off.  Keep it.
+                  history on or off.  Keep it.  If it cannot be read (say,
+                  after a hand edit), nvEmacs asks: move it aside to
+                  settings-damaged-<date>.eld and start a new one, go on
+                  without settings and write none this session, or quit.
   state.eld       remembered values (the tags column width from the last
                   session, the sort).  Safe to delete.
   history.jsonl   your recent searches, while search history is on.
